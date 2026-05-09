@@ -10,6 +10,13 @@ This document explains how `devhub` works as a whole:
 
 It is written for readers who are comfortable with application code, but are not yet comfortable with Unix process management details.
 
+## Further reading
+
+If you want the design rationale behind this flow, these case studies go one level deeper:
+
+- [Process-Group-Based Project Management](case-studies/process-group-based-project-management.md)
+- [Startup Readiness and Failure Diagnostics](case-studies/startup-readiness-and-failure-diagnostics.md)
+
 ## What devhub is
 
 At a high level, `devhub` is a small CLI that manages local development projects from one config file.
@@ -33,6 +40,7 @@ That design choice explains almost everything else in the project.
   proj.json
   state.json
   Caddyfile
+  logs/
 ```
 
 You can think of them like this:
@@ -40,6 +48,7 @@ You can think of them like this:
 - `proj.json`: what can be run
 - `state.json`: what `devhub` currently believes it is managing
 - `Caddyfile`: what local HTTP routes should currently exist
+- `logs/`: per-project stdout/stderr for active and recent starts
 
 ## `proj.json`: desired project config
 
@@ -50,6 +59,8 @@ Each project entry defines:
 - `path`: where the project lives
 - `cmd`: how to start it
 - `port`: which local port, if any, should be proxied
+- `startup_timeout_ms`: how long `devhub start` waits for readiness
+- `ready_cmd`: an optional custom readiness probe command
 
 Example:
 
@@ -67,7 +78,14 @@ This means:
 
 - when asked to start `worth`, `devhub` should `cd` into that directory
 - run `pnpm dev`
+- wait until readiness succeeds
 - if the project is running, expose it as `http://worth.localhost:1300`
+
+The readiness rules are intentionally simple:
+
+- if `ready_cmd` is set, `devhub` repeatedly runs it until it exits `0`
+- otherwise, if `port` is set, `devhub` repeatedly tries a TCP connection to `127.0.0.1:<port>`
+- otherwise, `devhub` falls back to spawn-only behavior and cannot strongly verify readiness
 
 ## `state.json`: runtime ownership
 
@@ -108,6 +126,23 @@ If the project is no longer running, that route should disappear.
 
 So Caddy is not the primary source of truth. It is a derived artifact that should match the current managed state.
 
+## `logs/`: stdout and stderr during startup and runtime
+
+Each project writes its stdout and stderr to:
+
+```text
+~/.devhub/logs/<project>.log
+```
+
+The log lifecycle is intentionally simple:
+
+- on successful start, the log stays while the service runs
+- on `stop`, the log is deleted
+- on startup failure, `devhub` prints the tail of the log and deletes it immediately
+- on later commands, inactive logs older than one day are cleaned up automatically
+
+This gives startup diagnostics without keeping unbounded historical logs around forever.
+
 ## The top-level command loop
 
 Every `devhub` command follows the same top-level structure:
@@ -116,8 +151,9 @@ Every `devhub` command follows the same top-level structure:
 2. Load `proj.json`.
 3. Load `state.json`.
 4. Prune entries whose managed process groups no longer exist.
-5. Reconcile the generated `Caddyfile` with what is on disk now.
-6. Execute the requested subcommand.
+5. Clean up inactive old log files.
+6. Reconcile the generated `Caddyfile` with what is on disk now.
+7. Execute the requested subcommand.
 
 This means even a read-oriented command such as `status` still does housekeeping:
 
@@ -249,19 +285,22 @@ The flow is:
 
 1. Load config and current state.
 2. Remove stale state entries whose process groups no longer exist.
-3. Reconcile Caddy so old stale routes disappear first.
-4. Look up the `worth` config entry.
-5. Expand `~` in the configured path.
-6. Spawn `sh -c "pnpm dev"` in that directory.
-7. Put that child in a new process group with `.process_group(0)`.
-8. Record the group's identifier and port in `state.json`.
-9. If a `port` exists, regenerate the desired Caddy config and reload or start Caddy.
-10. Print the project identifier and URL to the user.
+3. Clean up old inactive logs.
+4. Reconcile Caddy so old stale routes disappear first.
+5. Look up the `worth` config entry.
+6. Create or truncate `~/.devhub/logs/worth.log`.
+7. Expand `~` in the configured path.
+8. Spawn `sh -c "pnpm dev"` in that directory.
+9. Put that child in a new process group with `.process_group(0)`.
+10. Poll readiness until it succeeds, the process group exits, or `startup_timeout_ms` is reached.
+11. Only after readiness succeeds, record the group's identifier and port in `state.json`.
+12. If a `port` exists, regenerate the desired Caddy config and reload or start Caddy.
+13. Print the project identifier and URL to the user.
 
 Two easy-to-miss implementation details:
 
-- `stdout` and `stderr` are currently redirected to `/dev/null`
-- `devhub` exits after spawning, so the project continues independently
+- `stdout` and `stderr` are written to the project log file
+- `devhub` exits after startup completes, so the project continues independently
 
 ## Flow of `devhub status`
 
@@ -275,9 +314,10 @@ The flow is:
 
 1. Load config and state.
 2. Prune dead managed groups.
-3. Reconcile Caddy with the updated state.
-4. For each configured project, check whether its recorded managed group is still alive.
-5. Print `running` or `stopped`.
+3. Clean up inactive old logs.
+4. Reconcile Caddy with the updated state.
+5. For each configured project, check whether its recorded managed group is still alive.
+6. Print `running` or `stopped`.
 
 `status` does not try to discover arbitrary local processes or claim any process that happens to own the configured port.
 
@@ -301,7 +341,8 @@ The flow is:
 4. Wait 100ms.
 5. If the group still exists, send `SIGKILL` to the whole group.
 6. Remove `worth` from `state.json`.
-7. Reconcile Caddy so the route disappears.
+7. Delete `~/.devhub/logs/worth.log`.
+8. Reconcile Caddy so the route disappears.
 
 Why terminate the group instead of just one PID?
 
@@ -358,11 +399,14 @@ The exact parent-child structure is less important than these two facts:
 
 From that point on, the whole project flow makes sense:
 
-1. `start` records `42000` in `state.json`
-2. `start` generates a Caddy route to `localhost:3000`
-3. `status` probes whether process group `42000` still exists
-4. `stop` sends signals to process group `42000`
-5. when the group is gone, the route is removed from the generated `Caddyfile`
+1. `start` writes output to `~/.devhub/logs/worth.log`
+2. `start` waits until the configured readiness condition passes
+3. `start` records `42000` in `state.json`
+4. `start` generates a Caddy route to `localhost:3000`
+5. `status` probes whether process group `42000` still exists
+6. `stop` sends signals to process group `42000`
+7. `stop` deletes the log
+8. when the group is gone, the route is removed from the generated `Caddyfile`
 
 ## One useful edge case
 
@@ -394,7 +438,7 @@ This is the core reason the whole design is based on process-group liveness inst
 `devhub` is intentionally simple, so a few limits are worth knowing:
 
 - it is not a daemon and does not continuously monitor projects
-- it does not currently persist stdout or stderr logs
+- long-running projects can still generate large logs during a single run; cleanup is lifecycle-based rather than size-based
 - it does not try to infer ownership from arbitrary port listeners
 - the stored field is still named `pid`, even though lifecycle logic now treats it as the managed process-group identifier
 
