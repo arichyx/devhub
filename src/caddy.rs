@@ -32,7 +32,10 @@ pub fn reconcile_caddy(state: &AppState) -> eyre::Result<bool> {
     let current = match std::fs::read_to_string(&path) {
         Ok(content) => Some(content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err).with_context(|| format!("failed to read Caddyfile from {}", path.display())),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read Caddyfile from {}", path.display()));
+        }
     };
 
     if caddyfile_is_current(&desired, current.as_deref()) {
@@ -101,11 +104,15 @@ fn run_caddy(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> eyr
 }
 
 trait ChildExt {
-    fn wait_timeout(&mut self, timeout: Duration) -> eyre::Result<Option<std::process::ExitStatus>>;
+    fn wait_timeout(&mut self, timeout: Duration)
+    -> eyre::Result<Option<std::process::ExitStatus>>;
 }
 
 impl ChildExt for std::process::Child {
-    fn wait_timeout(&mut self, timeout: Duration) -> eyre::Result<Option<std::process::ExitStatus>> {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> eyre::Result<Option<std::process::ExitStatus>> {
         let start = std::time::Instant::now();
         loop {
             match self.try_wait()? {
@@ -126,11 +133,14 @@ mod tests {
     fn make_state(entries: Vec<(&str, u32, Option<u16>)>) -> AppState {
         let mut processes = std::collections::HashMap::new();
         for (name, pid, port) in entries {
-            processes.insert(name.to_string(), ProcessState {
-                pid,
-                started_at: Utc::now(),
-                port,
-            });
+            processes.insert(
+                name.to_string(),
+                ProcessState {
+                    pid,
+                    started_at: Utc::now(),
+                    port,
+                },
+            );
         }
         AppState { processes }
     }

@@ -1,13 +1,14 @@
 mod caddy;
 mod config;
 mod dirs;
+mod logs;
 mod process;
 mod state;
 
 use std::process::ExitCode;
 
-use eyre::Result;
 use clap::{Parser, Subcommand};
+use eyre::Result;
 
 #[derive(Parser)]
 #[command(name = "devhub", version, about = "Manage local development projects")]
@@ -53,6 +54,10 @@ fn run() -> Result<()> {
         state.save()?;
     }
 
+    if let Err(e) = logs::cleanup_outdated_logs(&state) {
+        eprintln!("warning: log cleanup failed: {e:#}");
+    }
+
     if let Err(e) = caddy::reconcile_caddy(&state) {
         eprintln!("warning: caddy reload failed: {e:#}");
     }
@@ -72,7 +77,10 @@ fn cmd_list(config: &config::Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<40} {:<10} {}", "PROJECT", "PATH", "PORT", "COMMAND");
+    println!(
+        "{:<20} {:<40} {:<10} {}",
+        "PROJECT", "PATH", "PORT", "COMMAND"
+    );
     for (name, proj) in &config.projects {
         let port = proj.port.map(|p| p.to_string()).unwrap_or("-".to_string());
         println!("{:<20} {:<40} {:<10} {}", name, proj.path, port, proj.cmd);
@@ -82,10 +90,14 @@ fn cmd_list(config: &config::Config) -> Result<()> {
 }
 
 fn cmd_start(name: &str, config: &config::Config, state: &mut state::AppState) -> Result<()> {
-    let proj = config.projects.get(name)
+    let proj = config
+        .projects
+        .get(name)
         .ok_or_else(|| eyre::eyre!("project '{}' not found in config", name))?;
 
     println!("Starting '{name}'...");
+    println!("  log:  {}", logs::project_log_path(name)?.display());
+    println!("  readiness:  {}", process::describe_readiness(proj));
     let pid = process::start_project(name, proj, state)?;
 
     if let Some(port) = proj.port {
@@ -109,9 +121,11 @@ fn cmd_stop(name: &str, state: &mut state::AppState) -> Result<()> {
     let had_port = state.processes.get(name).and_then(|ps| ps.port);
 
     process::stop_project(name, state)?;
+    if let Err(e) = logs::remove_project_log(name) {
+        eprintln!("  warning: log cleanup failed: {e:#}");
+    }
 
     if had_port.is_some() {
-        let _config = config::Config::load()?;
         if let Err(e) = caddy::reload_caddy(state) {
             eprintln!("  warning: caddy reload failed: {e:#}");
         }
@@ -132,7 +146,8 @@ fn cmd_status(config: &config::Config, state: &mut state::AppState) -> Result<()
         if state.is_running(name) {
             let ps = &state.processes[name];
             let status = "running";
-            let url = ps.port
+            let url = ps
+                .port
                 .map(|p| format!("http://{}.localhost:1300 (→ :{})", name, p))
                 .unwrap_or("-".to_string());
             println!("{:<20} {:<12} {:<8} {}", name, status, ps.pid, url);

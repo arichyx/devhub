@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use eyre::WrapErr;
 use chrono::{DateTime, Utc};
+use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 
 use crate::dirs;
@@ -41,11 +41,14 @@ impl AppState {
     }
 
     pub fn add(&mut self, name: String, pid: u32, port: Option<u16>) {
-        self.processes.insert(name, ProcessState {
-            pid,
-            started_at: Utc::now(),
-            port,
-        });
+        self.processes.insert(
+            name,
+            ProcessState {
+                pid,
+                started_at: Utc::now(),
+                port,
+            },
+        );
     }
 
     pub fn remove(&mut self, name: &str) -> Option<ProcessState> {
@@ -62,7 +65,9 @@ impl AppState {
 
     /// Remove entries whose processes are no longer alive and return them.
     pub fn prune_dead(&mut self) -> Vec<(String, ProcessState)> {
-        let dead_names: Vec<String> = self.processes.iter()
+        let dead_names: Vec<String> = self
+            .processes
+            .iter()
             .filter(|(_, ps)| !is_process_group_alive(ps.pid))
             .map(|(name, _)| name.clone())
             .collect();
@@ -78,6 +83,7 @@ impl AppState {
     }
 }
 
+#[allow(dead_code)]
 pub fn is_pid_alive(pid: u32) -> bool {
     signal_target_exists(pid as i32)
 }
