@@ -54,29 +54,48 @@ impl AppState {
 
     pub fn is_running(&self, name: &str) -> bool {
         if let Some(ps) = self.processes.get(name) {
-            is_pid_alive(ps.pid)
+            is_process_group_alive(ps.pid)
         } else {
             false
         }
     }
 
-    /// Remove entries whose processes are no longer alive.
-    pub fn prune_dead(&mut self) -> Vec<String> {
-        let dead: Vec<String> = self.processes.iter()
-            .filter(|(_, ps)| !is_pid_alive(ps.pid))
+    /// Remove entries whose processes are no longer alive and return them.
+    pub fn prune_dead(&mut self) -> Vec<(String, ProcessState)> {
+        let dead_names: Vec<String> = self.processes.iter()
+            .filter(|(_, ps)| !is_process_group_alive(ps.pid))
             .map(|(name, _)| name.clone())
             .collect();
-        for name in &dead {
-            self.processes.remove(name);
+
+        let mut dead = Vec::with_capacity(dead_names.len());
+        for name in dead_names {
+            if let Some(process) = self.processes.remove(&name) {
+                dead.push((name, process));
+            }
         }
+
         dead
     }
 }
 
 pub fn is_pid_alive(pid: u32) -> bool {
-    // Send signal 0 to check if process exists
+    signal_target_exists(pid as i32)
+}
+
+pub fn is_process_group_alive(group_id: u32) -> bool {
+    signal_target_exists(-(group_id as i32))
+}
+
+fn signal_target_exists(target: i32) -> bool {
     unsafe {
-        libc::kill(pid as i32, 0) == 0
+        if libc::kill(target, 0) == 0 {
+            true
+        } else {
+            matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            )
+        }
     }
 }
 
@@ -124,14 +143,21 @@ mod tests {
     }
 
     #[test]
+    fn is_process_group_alive_nonexistent() {
+        assert!(!is_process_group_alive(99999999));
+    }
+
+    #[test]
     fn prune_dead_processes() {
         let mut state = AppState::default();
-        let current_pid = std::process::id();
-        state.add("alive".to_string(), current_pid, None);
-        state.add("dead".to_string(), 99999999, None);
+        let current_group_id = unsafe { libc::getpgrp() as u32 };
+        state.add("alive".to_string(), current_group_id, None);
+        state.add("dead".to_string(), 99999999, Some(3000));
 
         let dead = state.prune_dead();
-        assert_eq!(dead, vec!["dead".to_string()]);
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].0, "dead");
+        assert_eq!(dead[0].1.port, Some(3000));
         assert_eq!(state.processes.len(), 1);
         assert!(state.processes.contains_key("alive"));
     }

@@ -26,6 +26,23 @@ pub fn generate_caddyfile(state: &AppState) -> String {
     entries.join("\n\n")
 }
 
+pub fn reconcile_caddy(state: &AppState) -> eyre::Result<bool> {
+    let desired = generate_caddyfile(state);
+    let path = dirs::caddyfile_path()?;
+    let current = match std::fs::read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("failed to read Caddyfile from {}", path.display())),
+    };
+
+    if caddyfile_is_current(&desired, current.as_deref()) {
+        return Ok(false);
+    }
+
+    reload_caddy(state)?;
+    Ok(true)
+}
+
 pub fn reload_caddy(state: &AppState) -> eyre::Result<()> {
     let content = generate_caddyfile(state);
 
@@ -55,6 +72,14 @@ pub fn reload_caddy(state: &AppState) -> eyre::Result<()> {
         Ok(true) => Ok(()),
         Ok(false) => Err(eyre!("caddy start did not complete in time")),
         Err(e) => Err(e),
+    }
+}
+
+fn caddyfile_is_current(desired: &str, current: Option<&str>) -> bool {
+    match (desired.is_empty(), current) {
+        (true, None) => true,
+        (_, Some(current)) => desired == current,
+        (false, None) => false,
     }
 }
 
@@ -141,5 +166,29 @@ mod tests {
         let content = generate_caddyfile(&state);
         let expected = "http://app.localhost:1300 {\n    reverse_proxy localhost:8080\n}";
         assert_eq!(content, expected);
+    }
+
+    #[test]
+    fn current_caddyfile_matches_desired_content() {
+        let state = make_state(vec![("app", 100, Some(8080))]);
+        let desired = generate_caddyfile(&state);
+
+        assert!(caddyfile_is_current(&desired, Some(&desired)));
+    }
+
+    #[test]
+    fn missing_caddyfile_is_stale_when_routes_are_expected() {
+        let state = make_state(vec![("app", 100, Some(8080))]);
+        let desired = generate_caddyfile(&state);
+
+        assert!(!caddyfile_is_current(&desired, None));
+    }
+
+    #[test]
+    fn leftover_caddyfile_is_stale_when_no_routes_are_expected() {
+        let desired = String::new();
+        let current = "http://app.localhost:1300 {\n    reverse_proxy localhost:8080\n}";
+
+        assert!(!caddyfile_is_current(&desired, Some(current)));
     }
 }

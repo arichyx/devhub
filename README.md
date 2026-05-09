@@ -98,6 +98,8 @@ Stopped.
 - Stale entries (PIDs that are no longer alive) are **automatically pruned** on every command.
 - Projects with a `port` field get a Caddy reverse proxy entry at `http://<name>.localhost:1300 → localhost:<port>`. Caddy is reloaded (or started) automatically.
 
+For a detailed explanation of process groups, status/stop semantics, Caddy reconciliation, and a worked `worth` example, see [docs/process-management.md](docs/process-management.md).
+
 ## Development
 
 ```bash

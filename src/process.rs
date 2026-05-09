@@ -43,10 +43,10 @@ pub fn stop_project(name: &str, state: &mut AppState) -> eyre::Result<()> {
 
     let pid = state.processes[name].pid;
 
-    if !state.is_running(name) {
+    if !crate::state::is_process_group_alive(pid) {
         state.remove(name);
         state.save()?;
-        bail!("project '{}' process (pid {}) is no longer alive", name, pid);
+        bail!("project '{}' process group (pid {}) is no longer alive", name, pid);
     }
 
     // Kill the entire process group (negative PID sends to group)
@@ -74,7 +74,7 @@ fn kill_process_group(pid: u32) -> eyre::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Check if still alive, force kill if necessary
-    if crate::state::is_pid_alive(pid) {
+    if crate::state::is_process_group_alive(pid) {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
             libc::kill(pid as i32, libc::SIGKILL);
@@ -130,7 +130,7 @@ mod tests {
             port: None,
         };
 
-        let pid = start_project("dup", &config, &mut state).unwrap();
+        let _pid = start_project("dup", &config, &mut state).unwrap();
 
         // Try to start again
         let result = start_project("dup", &config, &mut state);
@@ -146,5 +146,28 @@ mod tests {
         let mut state = AppState::default();
         let result = stop_project("nonexistent", &mut state);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn kill_group_when_leader_has_exited() {
+        let mut leader = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & exec true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        let group_id = leader.id();
+        let status = leader.wait().unwrap();
+        assert!(status.success());
+        assert!(!crate::state::is_pid_alive(group_id));
+        assert!(crate::state::is_process_group_alive(group_id));
+
+        kill_process_group(group_id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(!crate::state::is_process_group_alive(group_id));
     }
 }

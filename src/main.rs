@@ -53,6 +53,10 @@ fn run() -> Result<()> {
         state.save()?;
     }
 
+    if let Err(e) = caddy::reconcile_caddy(&state) {
+        eprintln!("warning: caddy reload failed: {e:#}");
+    }
+
     match cli.command {
         Commands::List => cmd_list(&config),
         Commands::Start { name } => cmd_start(&name, &config, &mut state),
