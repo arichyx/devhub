@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use eyre::WrapErr;
+use eyre::{WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::dirs;
@@ -34,7 +34,43 @@ impl Config {
             .with_context(|| format!("failed to read config from {}", path.display()))?;
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse config from {}", path.display()))?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Readiness probing and Caddy routing both target `port`, so two projects
+    /// declaring the same port would let one project's listener satisfy the
+    /// other's readiness probe and claim its proxy route.
+    pub fn validate(&self) -> eyre::Result<()> {
+        let mut ports: HashMap<u16, Vec<&str>> = HashMap::new();
+        for (name, project) in &self.projects {
+            if let Some(port) = project.port {
+                ports.entry(port).or_default().push(name.as_str());
+            }
+        }
+
+        let mut duplicates: Vec<String> = ports
+            .into_iter()
+            .filter(|(_, names)| names.len() > 1)
+            .map(|(port, mut names)| {
+                names.sort_unstable();
+                format!(
+                    "duplicate port {port} declared by projects {}",
+                    names
+                        .iter()
+                        .map(|name| format!("'{name}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect();
+        duplicates.sort_unstable();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", duplicates.join("; "))
+        }
     }
 }
 
@@ -80,6 +116,55 @@ mod tests {
             config.projects["blog"].startup_timeout_ms,
             default_startup_timeout_ms()
         );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ports() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "first": {"path": "/tmp", "cmd": "true", "port": 3000},
+            "second": {"path": "/tmp", "cmd": "true", "port": 3000},
+            "third": {"path": "/tmp", "cmd": "true", "port": 4000}
+        }"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate port 3000"), "error was: {error}");
+        assert!(error.contains("'first'"), "error was: {error}");
+        assert!(error.contains("'second'"), "error was: {error}");
+        assert!(!error.contains("'third'"), "error was: {error}");
+    }
+
+    #[test]
+    fn validate_lists_all_duplicated_ports() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "a": {"path": "/tmp", "cmd": "true", "port": 3000},
+            "b": {"path": "/tmp", "cmd": "true", "port": 3000},
+            "c": {"path": "/tmp", "cmd": "true", "port": 4000},
+            "d": {"path": "/tmp", "cmd": "true", "port": 4000}
+        }"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("port 3000"), "error was: {error}");
+        assert!(error.contains("port 4000"), "error was: {error}");
+    }
+
+    #[test]
+    fn validate_accepts_unique_ports() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "a": {"path": "/tmp", "cmd": "true", "port": 3000},
+            "b": {"path": "/tmp", "cmd": "true", "port": 4000},
+            "c": {"path": "/tmp", "cmd": "true"}
+        }"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]

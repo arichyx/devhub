@@ -303,6 +303,72 @@ time.sleep(30)
 }
 
 #[test]
+fn duplicate_ports_in_config_are_rejected() {
+    let env = TestEnv::new();
+
+    env.write_config(json!({
+        "first": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "sleep 30",
+            "port": 4500
+        },
+        "second": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "sleep 30",
+            "port": 4500
+        }
+    }));
+
+    let list = env.run(&["list"]);
+    assert!(
+        !list.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        list.stdout,
+        list.stderr
+    );
+    assert!(list.stderr.contains("duplicate port 4500"), "{}", list.stderr);
+    assert!(list.stderr.contains("'first'"), "{}", list.stderr);
+    assert!(list.stderr.contains("'second'"), "{}", list.stderr);
+}
+
+#[test]
+fn start_fails_when_foreign_process_holds_the_port() {
+    let env = TestEnv::new();
+    // Listener owned by the test process, i.e. outside any project group
+    // devhub spawns.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    env.write_config(json!({
+        "victim": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "sleep 30",
+            "port": port,
+            "startup_timeout_ms": 5000
+        }
+    }));
+
+    let start = env.run(&["start", "victim"]);
+    assert!(
+        !start.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        start.stdout,
+        start.stderr
+    );
+    assert!(
+        start.stderr.contains(&format!("port {port} is held by pid")),
+        "{}",
+        start.stderr
+    );
+
+    // The squatted port must not be recorded as a running project, and no
+    // proxy route may be created for it.
+    let state = env.read_state().unwrap_or_else(|| json!({}));
+    assert_eq!(state, json!({}));
+    assert!(!env.caddyfile_path().exists());
+}
+
+#[test]
 fn stale_inactive_logs_are_cleaned_on_next_command() {
     let env = TestEnv::new();
     env.write_config(json!({}));

@@ -87,6 +87,11 @@ The readiness rules are intentionally simple:
 - otherwise, if `port` is set, `devhub` repeatedly tries a TCP connection to `127.0.0.1:<port>`
 - otherwise, `devhub` falls back to spawn-only behavior and cannot strongly verify readiness
 
+One correctness rule sits on top of the port-based probes: a connect alone does not prove the *project* is ready, only that *something* is listening. So whenever `port` is configured, `devhub` also asks `lsof`/`ps` for the listener's process group and requires it to match the group it spawned (children inherit the group). Two failure classes fall out of this:
+
+- a stale server or a manually started dev server squatting on the port fails the start immediately, naming the offending PID, instead of silently receiving the project's proxy route
+- two projects declaring the same `port` could otherwise let one project's listener satisfy the other's probe — `devhub` rejects such a config at load time
+
 ## `state.json`: runtime ownership
 
 `state.json` is owned by `devhub`, not by the user.

@@ -182,8 +182,22 @@ fn wait_for_startup(
 
         let remaining = deadline.saturating_duration_since(now);
         let probe_timeout = remaining.min(READY_CMD_TIMEOUT_CAP);
-        if readiness_probe_passed(config, project_dir, probe_timeout)? {
-            return Ok(());
+        match readiness_probe_passed(config, project_dir, probe_timeout, group_id)? {
+            ProbeOutcome::Ready => return Ok(()),
+            ProbeOutcome::NotYet => {}
+            ProbeOutcome::ForeignListener { port, pid, command } => {
+                if crate::state::is_process_group_alive(group_id) {
+                    let _ = kill_process_group(group_id);
+                }
+                return Err(startup_failure(
+                    name,
+                    format!(
+                        "port {port} is held by pid {pid} (`{command}`), which is not part of \
+                         this project — another project or a manually started server may \
+                         already be using it"
+                    ),
+                ));
+            }
         }
 
         if Instant::now() >= deadline {
@@ -200,20 +214,109 @@ fn wait_for_startup(
     }
 }
 
+enum ProbeOutcome {
+    Ready,
+    NotYet,
+    ForeignListener {
+        port: u16,
+        pid: u32,
+        command: String,
+    },
+}
+
 fn readiness_probe_passed(
     config: &ProjectConfig,
     project_dir: &Path,
     probe_timeout: Duration,
-) -> eyre::Result<bool> {
+    group_id: u32,
+) -> eyre::Result<ProbeOutcome> {
     if let Some(cmd) = &config.ready_cmd {
-        return exec_readiness_probe(cmd, project_dir, probe_timeout);
+        if !exec_readiness_probe(cmd, project_dir, probe_timeout)? {
+            return Ok(ProbeOutcome::NotYet);
+        }
+        // A ready_cmd cannot tell *who* answered; when a port is also
+        // configured, require the listener to be ours before declaring ready.
+        return Ok(match config.port {
+            Some(port) => port_readiness(port, group_id),
+            None => ProbeOutcome::Ready,
+        });
     }
 
     if let Some(port) = config.port {
-        return Ok(tcp_readiness_probe(port));
+        return Ok(port_readiness(port, group_id));
     }
 
-    Ok(false)
+    Ok(ProbeOutcome::Ready)
+}
+
+/// Probe `port` and, once something is listening, verify the listener belongs
+/// to the project's process group. Without the ownership check any unrelated
+/// listener (a stale server, another project on the same port) would satisfy
+/// the probe and silently receive this project's Caddy route.
+fn port_readiness(port: u16, group_id: u32) -> ProbeOutcome {
+    if !tcp_readiness_probe(port) {
+        return ProbeOutcome::NotYet;
+    }
+
+    let Some(pids) = listening_pids(port) else {
+        // lsof could not attribute the listener; fall back to connect-only semantics.
+        return ProbeOutcome::Ready;
+    };
+
+    let mut foreign: Option<(u32, String)> = None;
+    for pid in pids {
+        if let Some((pgid, command)) = listener_details(pid) {
+            if pgid == group_id {
+                return ProbeOutcome::Ready;
+            }
+            foreign = foreign.or(Some((pid, command)));
+        }
+    }
+
+    match foreign {
+        Some((pid, command)) => ProbeOutcome::ForeignListener { port, pid, command },
+        // Connect succeeded but no listener could be identified (it likely
+        // exited in between); treat it as ready, like a connect-only probe.
+        None => ProbeOutcome::Ready,
+    }
+}
+
+/// PIDs with a TCP listener on `port`, or `None` when lsof cannot attribute
+/// the listener (not installed, or no match found).
+fn listening_pids(port: u16) -> Option<Vec<u32>> {
+    let output = Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    if pids.is_empty() {
+        None
+    } else {
+        Some(pids)
+    }
+}
+
+/// Process group id and command name of `pid`, or `None` if it is already gone.
+fn listener_details(pid: u32) -> Option<(u32, String)> {
+    let output = Command::new("ps")
+        .args(["-o", "pgid=,comm=", "-p", &pid.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split_whitespace();
+    let pgid: u32 = parts.next()?.parse().ok()?;
+    let command = parts.collect::<Vec<_>>().join(" ");
+    Some((pgid, command))
 }
 
 fn exec_readiness_probe(cmd: &str, project_dir: &Path, timeout: Duration) -> eyre::Result<bool> {
@@ -385,6 +488,40 @@ mod tests {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(tcp_readiness_probe(port));
+    }
+
+    #[test]
+    fn start_fails_when_port_is_held_by_foreign_listener() {
+        with_temp_devhub_dir(|| {
+            // Listener owned by this test process, i.e. outside the spawned
+            // project's process group.
+            let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let mut state = AppState::default();
+            let config = ProjectConfig {
+                path: "/tmp".to_string(),
+                cmd: "sleep 30".to_string(),
+                port: Some(port),
+                startup_timeout_ms: 5_000,
+                ready_cmd: None,
+            };
+
+            let error = start_project("foreign-port", &config, &mut state).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("port {port} is held by pid")),
+                "error was: {message}"
+            );
+            assert!(!state.is_running("foreign-port"));
+            let _ = logs::remove_project_log("foreign-port");
+        });
+    }
+
+    #[test]
+    fn listener_details_reports_process_group() {
+        let (pgid, _) = listener_details(std::process::id()).unwrap();
+        assert_eq!(pgid, unsafe { libc::getpgrp() as u32 });
     }
 
     #[test]

@@ -46,7 +46,7 @@ Each project supports these fields:
 |-------|----------|-------------|
 | `path` | yes | Project directory. Supports `~` for home dir. |
 | `cmd` | yes | Shell command to start the project. |
-| `port` | no | If set, devhub sets up a Caddy reverse proxy at `<name>.localhost:1300` and, unless `ready_cmd` is set, uses a TCP readiness probe against `127.0.0.1:<port>`. |
+| `port` | no | If set, devhub sets up a Caddy reverse proxy at `<name>.localhost:1300` and, unless `ready_cmd` is set, uses a TCP readiness probe against `127.0.0.1:<port>`. Must be unique across projects. |
 | `startup_timeout_ms` | no | How long `devhub start` waits for readiness before failing. Defaults to `60000`. |
 | `ready_cmd` | no | Custom readiness probe command. If set, `devhub start` runs this command until it exits `0`, the project exits first, or the timeout is reached. |
 
@@ -102,6 +102,7 @@ Stopped.
 
 - Processes are spawned in a **new process group** (`setpgid`), fully detached from the devhub CLI. They survive after devhub exits.
 - `devhub start` waits for readiness instead of treating `spawn()` as success. If `ready_cmd` is set, it is polled until it exits `0`; otherwise, a project with `port` uses a TCP readiness probe against `127.0.0.1:<port>`.
+- The TCP probe verifies the listener on `port` belongs to the project's own process group. If an unrelated process holds the port (a stale server, a manually started dev server), the start fails immediately and names the offending PID instead of letting that process answer the probe and receive the project's proxy route. Ports must also be unique across projects — a config that declares the same port twice is rejected at load time.
 - During startup and runtime, project `stdout`/`stderr` are written to `~/.devhub/logs/<name>.log`.
 - On `stop`, the entire process group receives `SIGTERM` (then `SIGKILL` if it doesn't exit within 100ms).
 - Stale entries (PIDs that are no longer alive) are **automatically pruned** on every command.
