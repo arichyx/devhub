@@ -9,7 +9,7 @@ We wanted `devhub` to be a lightweight CLI, not a long-lived background daemon, 
 - start multiple local development projects
 - stop them cleanly later
 - show trustworthy status
-- expose stable local URLs such as `http://worth.localhost:1300`
+- expose stable local URLs such as `http://worth.localhost`
 
 The catch is that modern dev commands rarely map to one stable PID. A single `pnpm dev` can fan out into a shell, a package manager wrapper, a framework command, the actual HTTP server, and worker processes. If we chose the wrong ownership model, `devhub` could easily report the wrong status or stop the wrong thing.
 

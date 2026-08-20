@@ -283,7 +283,7 @@ fn port_readiness(port: u16, group_id: u32) -> ProbeOutcome {
 
 /// PIDs with a TCP listener on `port`, or `None` when lsof cannot attribute
 /// the listener (not installed, or no match found).
-fn listening_pids(port: u16) -> Option<Vec<u32>> {
+pub(crate) fn listening_pids(port: u16) -> Option<Vec<u32>> {
     let output = Command::new("lsof")
         .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
         .stdout(Stdio::piped())
@@ -304,7 +304,7 @@ fn listening_pids(port: u16) -> Option<Vec<u32>> {
 }
 
 /// Process group id and command name of `pid`, or `None` if it is already gone.
-fn listener_details(pid: u32) -> Option<(u32, String)> {
+pub(crate) fn listener_details(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
         .args(["-o", "pgid=,comm=", "-p", &pid.to_string()])
         .stdout(Stdio::piped())

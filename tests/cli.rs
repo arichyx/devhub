@@ -289,7 +289,7 @@ time.sleep(30)
     );
     assert!(status.stdout.contains("tcp-app"));
     assert!(status.stdout.contains("running"));
-    assert!(status.stdout.contains("http://tcp-app.localhost:1300"));
+    assert!(status.stdout.contains("http://tcp-app.localhost ("));
 
     let stop = env.run(&["stop", "tcp-app"]);
     assert!(

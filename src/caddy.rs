@@ -8,13 +8,17 @@ use crate::state::AppState;
 
 const CADDY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The gateway listens on the standard HTTP port so project URLs stay
+/// port-free (`http://<name>.localhost`).
+const PROXY_PORT: u16 = 80;
+
 pub fn generate_caddyfile(state: &AppState) -> String {
     let mut entries = Vec::new();
 
     for (name, ps) in &state.processes {
         if let Some(port) = ps.port {
             entries.push(format!(
-                "http://{name}.localhost:1300 {{\n    reverse_proxy localhost:{port}\n}}"
+                "http://{name}.localhost {{\n    reverse_proxy localhost:{port}\n}}"
             ));
         }
     }
@@ -73,9 +77,30 @@ pub fn reload_caddy(state: &AppState) -> eyre::Result<()> {
     // Caddy not running — start it
     match run_caddy(["start", "--config", &config_arg]) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(eyre!("caddy start did not complete in time")),
+        Ok(false) => Err(eyre!(
+            "caddy failed to start; {}",
+            describe_port_conflict()
+        )),
+        // Spawn failures mean caddy itself is missing; nothing to diagnose.
         Err(e) => Err(e),
     }
+}
+
+/// Name the process holding the gateway port when caddy cannot bind it.
+fn describe_port_conflict() -> String {
+    if let Some(pids) = crate::process::listening_pids(PROXY_PORT) {
+        if let Some(pid) = pids.first() {
+            if let Some((_, command)) = crate::process::listener_details(*pid) {
+                if command.contains("caddy") {
+                    return format!(
+                        "an existing caddy instance (pid {pid}) already holds port {PROXY_PORT} — try `caddy stop`"
+                    );
+                }
+                return format!("port {PROXY_PORT} is held by pid {pid} (`{command}`)");
+            }
+        }
+    }
+    format!("check whether port {PROXY_PORT} is already in use")
 }
 
 fn caddyfile_is_current(desired: &str, current: Option<&str>) -> bool {
@@ -162,9 +187,9 @@ mod tests {
 
         let content = generate_caddyfile(&state);
 
-        assert!(content.contains("http://worth.localhost:1300"));
+        assert!(content.contains("http://worth.localhost {\n"));
         assert!(content.contains("reverse_proxy localhost:3000"));
-        assert!(content.contains("http://blog.localhost:1300"));
+        assert!(content.contains("http://blog.localhost {\n"));
         assert!(content.contains("reverse_proxy localhost:4000"));
         assert!(!content.contains("noport.local"));
     }
@@ -174,7 +199,7 @@ mod tests {
         let state = make_state(vec![("app", 100, Some(8080))]);
 
         let content = generate_caddyfile(&state);
-        let expected = "http://app.localhost:1300 {\n    reverse_proxy localhost:8080\n}";
+        let expected = "http://app.localhost {\n    reverse_proxy localhost:8080\n}";
         assert_eq!(content, expected);
     }
 
@@ -197,8 +222,14 @@ mod tests {
     #[test]
     fn leftover_caddyfile_is_stale_when_no_routes_are_expected() {
         let desired = String::new();
-        let current = "http://app.localhost:1300 {\n    reverse_proxy localhost:8080\n}";
+        let current = "http://app.localhost {\n    reverse_proxy localhost:8080\n}";
 
         assert!(!caddyfile_is_current(&desired, Some(current)));
+    }
+
+    #[test]
+    fn port_conflict_hint_mentions_gateway_port() {
+        let hint = describe_port_conflict();
+        assert!(hint.contains("80"), "hint was: {hint}");
     }
 }

@@ -25,7 +25,7 @@ It gives you three things:
 
 1. A single place to define projects.
 2. A way to start and stop those projects consistently.
-3. Friendly local URLs such as `http://worth.localhost:1300` through Caddy.
+3. Friendly local URLs such as `http://worth.localhost` through Caddy.
 
 It is intentionally simple. It is not a long-lived background daemon. Instead, each `devhub` command runs, does its work, updates a small amount of persisted state, and exits.
 
@@ -79,7 +79,7 @@ This means:
 - when asked to start `worth`, `devhub` should `cd` into that directory
 - run `pnpm dev`
 - wait until readiness succeeds
-- if the project is running, expose it as `http://worth.localhost:1300`
+- if the project is running, expose it as `http://worth.localhost`
 
 The readiness rules are intentionally simple:
 
@@ -122,10 +122,12 @@ start out as the same number.
 If a running project has a configured `port`, it gets a route like:
 
 ```text
-http://worth.localhost:1300 {
+http://worth.localhost {
     reverse_proxy localhost:3000
 }
 ```
+
+The site has no port suffix, so Caddy serves it on the standard HTTP port 80. macOS allows unprivileged processes to bind it, which keeps project URLs port-free.
 
 If the project is no longer running, that route should disappear.
 
@@ -367,7 +369,7 @@ This keeps proxy state derived from process state, rather than letting proxy sta
 That prevents situations such as:
 
 - the project is gone from `state.json`
-- but `worth.localhost:1300` still points at `localhost:3000`
+- but `worth.localhost` still points at `localhost:3000`
 
 ## End-to-end example: `worth`
 

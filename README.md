@@ -1,6 +1,6 @@
 # devhub
 
-A CLI tool for managing local development projects. Start, stop, and monitor your projects from a single config file, with automatic Caddy reverse proxy so you get clean URLs like `http://worth.localhost:1300` instead of memorizing `localhost:3000`.
+A CLI tool for managing local development projects. Start, stop, and monitor your projects from a single config file, with automatic Caddy reverse proxy so you get clean URLs like `http://worth.localhost` instead of memorizing `localhost:3000`.
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ Each project supports these fields:
 |-------|----------|-------------|
 | `path` | yes | Project directory. Supports `~` for home dir. |
 | `cmd` | yes | Shell command to start the project. |
-| `port` | no | If set, devhub sets up a Caddy reverse proxy at `<name>.localhost:1300` and, unless `ready_cmd` is set, uses a TCP readiness probe against `127.0.0.1:<port>`. Must be unique across projects. |
+| `port` | no | If set, devhub sets up a Caddy reverse proxy at `<name>.localhost` and, unless `ready_cmd` is set, uses a TCP readiness probe against `127.0.0.1:<port>`. Must be unique across projects. |
 | `startup_timeout_ms` | no | How long `devhub start` waits for readiness before failing. Defaults to `60000`. |
 | `ready_cmd` | no | Custom readiness probe command. If set, `devhub start` runs this command until it exits `0`, the project exits first, or the timeout is reached. |
 
@@ -68,7 +68,7 @@ Starting 'worth'...
   log:  /Users/you/.devhub/logs/worth.log
   readiness:  exec `curl -fsS http://127.0.0.1:3000/healthz`
   pid:  93128
-  url:  http://worth.localhost:1300 (→ localhost:3000)
+  url:  http://worth.localhost (→ localhost:3000)
 Started.
 ```
 
@@ -76,7 +76,7 @@ Started.
 $ devhub status
 
 PROJECT              STATUS       PID      URL
-worth                 running      93128    http://worth.localhost:1300 (→ :3000)
+worth                 running      93128    http://worth.localhost (→ :3000)
 blog                  stopped      -        -
 tauri-demo            stopped      -        -
 ```
@@ -107,7 +107,7 @@ Stopped.
 - On `stop`, the entire process group receives `SIGTERM` (then `SIGKILL` if it doesn't exit within 100ms).
 - Stale entries (PIDs that are no longer alive) are **automatically pruned** on every command.
 - Failed starts print the tail of the startup log and then delete that log. Successful project logs are deleted on `stop`, and inactive logs older than one day are cleaned up automatically on later commands.
-- Projects with a `port` field get a Caddy reverse proxy entry at `http://<name>.localhost:1300 → localhost:<port>`. Caddy is reloaded (or started) automatically.
+- Projects with a `port` field get a Caddy reverse proxy entry at `http://<name>.localhost → localhost:<port>`. The gateway listens on the standard HTTP port 80 (macOS allows unprivileged binding), so project URLs carry no port. Caddy is reloaded (or started) automatically; if port 80 is already held by another process, the error names the offending PID.
 
 For a detailed explanation of process groups, status/stop semantics, Caddy reconciliation, and a worked `worth` example, see [docs/process-management.md](docs/process-management.md).
 

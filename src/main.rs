@@ -102,7 +102,7 @@ fn cmd_start(name: &str, config: &config::Config, state: &mut state::AppState) -
 
     if let Some(port) = proj.port {
         println!("  pid:  {pid}");
-        println!("  url:  http://{name}.localhost:1300 (→ localhost:{port})");
+        println!("  url:  http://{name}.localhost (→ localhost:{port})");
 
         // Attempt Caddy reload
         if let Err(e) = caddy::reload_caddy(state) {
@@ -148,7 +148,7 @@ fn cmd_status(config: &config::Config, state: &mut state::AppState) -> Result<()
             let status = "running";
             let url = ps
                 .port
-                .map(|p| format!("http://{}.localhost:1300 (→ :{})", name, p))
+                .map(|p| format!("http://{}.localhost (→ :{})", name, p))
                 .unwrap_or("-".to_string());
             println!("{:<20} {:<12} {:<8} {}", name, status, ps.pid, url);
         } else {
