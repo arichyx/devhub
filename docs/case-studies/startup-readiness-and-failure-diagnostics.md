@@ -62,44 +62,60 @@ We adopted a simple precedence rule for readiness:
 2. Otherwise, if `port` is configured, use a TCP probe against `127.0.0.1:<port>`.
 3. Otherwise, fall back to spawn-only behavior because we have no strong readiness signal.
 
+One correctness rule sits on top of the port-based paths: a successful connect only proves that *something* is listening, not that it is *our* project. A stale server, a manually started dev server, or another project configured with the same port can satisfy the probe and silently receive the project's proxy route. So whenever `port` is configured, `devhub` also asks `lsof`/`ps` for the listener's process group and requires it to match the group it spawned — descendants inherit the group, so the real HTTP server matches even when the launcher already exited.
+
 That logic lives directly in the startup path:
 
 ```rust
-fn readiness_probe_passed(config: &ProjectConfig, project_dir: &Path) -> eyre::Result<bool> {
+fn readiness_probe_passed(
+    config: &ProjectConfig,
+    project_dir: &Path,
+    probe_timeout: Duration,
+    group_id: u32,
+) -> eyre::Result<ProbeOutcome> {
     if let Some(cmd) = &config.ready_cmd {
-        return exec_readiness_probe(cmd, project_dir);
+        if !exec_readiness_probe(cmd, project_dir, probe_timeout)? {
+            return Ok(ProbeOutcome::NotYet);
+        }
+        // A ready_cmd cannot tell *who* answered; when a port is also
+        // configured, require the listener to be ours before declaring ready.
+        return Ok(match config.port {
+            Some(port) => port_readiness(port, group_id),
+            None => ProbeOutcome::Ready,
+        });
     }
 
     if let Some(port) = config.port {
-        return Ok(tcp_readiness_probe(port));
+        return Ok(port_readiness(port, group_id));
     }
 
-    Ok(false)
+    Ok(ProbeOutcome::Ready)
 }
 ```
 
-`startup_timeout_ms` is not a success window. It is an upper bound on how long we are willing to wait for readiness before declaring the attempt failed.
-
-The main startup loop makes that explicit:
+When the listener turns out to be foreign, waiting is pointless — the project can never bind that port — so the start fails immediately, names the offending PID, and kills the group it just spawned:
 
 ```rust
-loop {
-    if let Some(status) = child.try_wait()? {
-        if !crate::state::is_process_group_alive(group_id) {
-            return Err(startup_failure(
-                name,
-                format!("project exited before becoming ready{}", format_exit_status(Some(&status))),
-            ));
+match readiness_probe_passed(config, project_dir, probe_timeout, group_id)? {
+    ProbeOutcome::Ready => return Ok(()),
+    ProbeOutcome::NotYet => {}
+    ProbeOutcome::ForeignListener { port, pid, command } => {
+        if crate::state::is_process_group_alive(group_id) {
+            let _ = kill_process_group(group_id);
         }
-    }
-
-    if readiness_probe_passed(config, project_dir)? {
-        return Ok(());
+        return Err(startup_failure(
+            name,
+            format!(
+                "port {port} is held by pid {pid} (`{command}`), which is not part of \
+                 this project — another project or a manually started server may \
+                 already be using it"
+            ),
+        ));
     }
 }
 ```
 
-The important design choice here is that we do not report success until readiness passes. A child process that merely exists is not enough.
+`startup_timeout_ms` is not a success window. It is an upper bound on how long we are willing to wait for readiness before declaring the attempt failed. The main startup loop re-checks group liveness, the deadline, and the probe outcome on every iteration, and it does not report success until readiness passes — a child process that merely exists is not enough.
 
 We also fixed the early-exit race by checking `child.try_wait()` before relying only on process-group liveness. That makes fast failures show up as “exited before becoming ready” instead of being misclassified as timeouts while the leader is still in transition.
 
@@ -155,13 +171,14 @@ pub fn cleanup_outdated_logs(state: &AppState) -> eyre::Result<usize> {
 
 The result is a startup contract that is much closer to what users actually mean:
 
-- success means the service became ready
-- failure means the service exited early or timed out before readiness
+- success means the service became ready, and — when a `port` is configured — that the listener belongs to the project's own process group
+- failure means the service exited early, timed out before readiness, or found its port already held by another process
 - errors come with enough recent output to debug the failure quickly
 
 ## Key Takeaways
 
 - Startup success should mean ready, not merely spawned.
+- A successful connect proves someone is listening, not that your service is; verify listener ownership when a port is part of the contract.
 - Readiness probing is more general than HTTP health checks.
 - `startup_timeout_ms` should be treated as an upper bound, not a guessed success window.
 - Log retention should be lifecycle-based if we want simple diagnostics without permanent accumulation.

@@ -1,7 +1,14 @@
 [package]
 name = "devhub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
+description = "CLI for managing local dev projects with readiness probes and an automatic Caddy reverse proxy"
+license = "MIT"
+repository = "https://github.com/arichyx/devhub"
+readme = "README.md"
+keywords = ["cli", "development", "process-manager", "caddy", "reverse-proxy"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }

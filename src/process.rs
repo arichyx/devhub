@@ -126,7 +126,7 @@ pub fn describe_readiness(config: &ProjectConfig) -> String {
     if let Some(cmd) = &config.ready_cmd {
         format!("exec `{cmd}`")
     } else if let Some(port) = config.port {
-        format!("tcp 127.0.0.1:{port}")
+        format!("tcp 127.0.0.1:{port} (listener ownership verified)")
     } else {
         "none (spawn only)".to_string()
     }

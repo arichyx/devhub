@@ -10,7 +10,13 @@ A CLI tool for managing local development projects. Start, stop, and monitor you
 ## Installation
 
 ```bash
-git clone <repo-url> devhub
+cargo install devhub
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/arichyx/devhub
 cd devhub
 cargo install --path .
 ```
@@ -23,15 +29,15 @@ Create `~/.devhub/proj.json`:
 {
   "worth": {
     "path": "~/Projects/worth_meter",
-    "cmd": "pnpm dev",
-    "port": 3000,
+    "cmd": "PORT=13001 pnpm dev",
+    "port": 13001,
     "startup_timeout_ms": 120000,
-    "ready_cmd": "curl -fsS http://127.0.0.1:3000/healthz"
+    "ready_cmd": "curl -fsS http://127.0.0.1:13001/healthz"
   },
   "blog": {
     "path": "~/Code/blogs",
-    "cmd": "pnpm dev",
-    "port": 4000
+    "cmd": "PORT=13002 pnpm dev",
+    "port": 13002
   },
   "tauri-demo": {
     "path": "~/playground/tauri-demo",
@@ -50,14 +56,18 @@ Each project supports these fields:
 | `startup_timeout_ms` | no | How long `devhub start` waits for readiness before failing. Defaults to `60000`. |
 | `ready_cmd` | no | Custom readiness probe command. If set, `devhub start` runs this command until it exits `0`, the project exits first, or the timeout is reached. |
 
+### Port conventions
+
+Ports are user-assigned, and `cmd` can carry the assignment to the app (`PORT=13001 pnpm dev`, `pnpm dev --port 13001`), so most projects need no code changes. Pick a dedicated block such as `13001, 13002, …` and stay out of the trouble zones: ports below 1024, popular dev defaults (3000, 5173, 8080), and the ephemeral ranges the OS hands to outgoing connections (32768+ on Linux, 49152+ on macOS). Ports must be unique across projects — a config that repeats one is rejected at load time.
+
 ## Usage
 
 ```
 $ devhub list
 
 PROJECT              PATH                                     PORT       COMMAND
-worth                 ~/Projects/worth_meter                   3000       pnpm dev
-blog                  ~/Code/blogs                             4000       pnpm dev
+worth                 ~/Projects/worth_meter                   13001      PORT=13001 pnpm dev
+blog                  ~/Code/blogs                             13002      PORT=13002 pnpm dev
 tauri-demo            ~/playground/tauri-demo                  -          pnpm tauri dev
 ```
 
@@ -66,9 +76,9 @@ $ devhub start worth
 
 Starting 'worth'...
   log:  /Users/you/.devhub/logs/worth.log
-  readiness:  exec `curl -fsS http://127.0.0.1:3000/healthz`
+  readiness:  exec `curl -fsS http://127.0.0.1:13001/healthz`
   pid:  93128
-  url:  http://worth.localhost (→ localhost:3000)
+  url:  http://worth.localhost (→ localhost:13001)
 Started.
 ```
 
@@ -76,7 +86,7 @@ Started.
 $ devhub status
 
 PROJECT              STATUS       PID      URL
-worth                 running      93128    http://worth.localhost (→ :3000)
+worth                 running      93128    http://worth.localhost (→ :13001)
 blog                  stopped      -        -
 tauri-demo            stopped      -        -
 ```

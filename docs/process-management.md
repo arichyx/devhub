@@ -68,8 +68,8 @@ Example:
 {
   "worth": {
     "path": "~/Documents/proj/worth-meter",
-    "cmd": "pnpm dev",
-    "port": 3000
+    "cmd": "PORT=13001 pnpm dev",
+    "port": 13001
   }
 }
 ```
@@ -123,7 +123,7 @@ If a running project has a configured `port`, it gets a route like:
 
 ```text
 http://worth.localhost {
-    reverse_proxy localhost:3000
+    reverse_proxy localhost:13001
 }
 ```
 
@@ -369,7 +369,7 @@ This keeps proxy state derived from process state, rather than letting proxy sta
 That prevents situations such as:
 
 - the project is gone from `state.json`
-- but `worth.localhost` still points at `localhost:3000`
+- but `worth.localhost` still points at `localhost:13001`
 
 ## End-to-end example: `worth`
 
@@ -379,8 +379,8 @@ Assume this config:
 {
   "worth": {
     "path": "~/Documents/proj/worth-meter",
-    "cmd": "pnpm dev",
-    "port": 3000
+    "cmd": "PORT=13001 pnpm dev",
+    "port": 13001
   }
 }
 ```
@@ -409,7 +409,7 @@ From that point on, the whole project flow makes sense:
 1. `start` writes output to `~/.devhub/logs/worth.log`
 2. `start` waits until the configured readiness condition passes
 3. `start` records `42000` in `state.json`
-4. `start` generates a Caddy route to `localhost:3000`
+4. `start` generates a Caddy route to `localhost:13001`
 5. `status` probes whether process group `42000` still exists
 6. `stop` sends signals to process group `42000`
 7. `stop` deletes the log
