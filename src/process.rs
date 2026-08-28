@@ -13,30 +13,75 @@ use crate::state::AppState;
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const READY_CMD_TIMEOUT_CAP: Duration = Duration::from_secs(1);
+const DEATH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const DEATH_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// What a stop request found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// A live process group was terminated.
+    Killed { pid: u32 },
+    /// There was nothing alive to stop; any stale state entry was removed.
+    AlreadyDead,
+}
+
+/// How a failed start left the spawned project.
+#[derive(Debug)]
+pub enum StartFailure {
+    /// Nothing from this start is left running.
+    NothingRunning(eyre::Report),
+    /// Termination of the spawned group could not be confirmed; it may
+    /// still be running, trackable only through the pid carried here.
+    MaybeRunning { pid: u32, err: eyre::Report },
+}
+
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = match self {
+            StartFailure::NothingRunning(report) => report,
+            StartFailure::MaybeRunning { err: report, .. } => report,
+        };
+        if f.alternate() {
+            write!(f, "{report:#}")
+        } else {
+            write!(f, "{report}")
+        }
+    }
+}
+
+impl std::error::Error for StartFailure {}
 
 pub fn start_project(
     name: &str,
     config: &ProjectConfig,
     state: &mut AppState,
-) -> eyre::Result<u32> {
+) -> Result<u32, StartFailure> {
     if state.is_running(name) {
-        bail!(
+        return Err(StartFailure::NothingRunning(eyre!(
             "project '{}' is already running (pid {})",
             name,
             state.processes[name].pid
-        );
+        )));
     }
 
     let expanded = expand_path(&config.path);
     let project_dir = Path::new(&expanded);
     if !project_dir.exists() {
-        bail!("project directory '{}' does not exist", expanded);
+        return Err(StartFailure::NothingRunning(eyre!(
+            "project directory '{}' does not exist",
+            expanded
+        )));
     }
 
-    let (_log_path, stdout_log) = logs::create_project_log(name)?;
-    let stderr_log = stdout_log
-        .try_clone()
-        .with_context(|| format!("failed to clone log handle for project '{name}'"))?;
+    // Flattened via {err:#} so the full context chain survives being carried
+    // inside StartFailure (its Error impl cannot delegate source()).
+    let (_log_path, stdout_log) = logs::create_project_log(name)
+        .map_err(|err| StartFailure::NothingRunning(eyre!("{err:#}")))?;
+    let stderr_log = stdout_log.try_clone().map_err(|err| {
+        StartFailure::NothingRunning(eyre!(
+            "failed to clone log handle for project '{name}': {err}"
+        ))
+    })?;
 
     // Spawn the command in a new process group so we can kill the whole group
     let mut child = match Command::new("sh")
@@ -51,9 +96,11 @@ pub fn start_project(
         Ok(child) => child,
         Err(err) => {
             let _ = logs::remove_project_log(name);
-            return Err(err).with_context(|| {
-                format!("failed to start command '{}' in {}", config.cmd, expanded)
-            });
+            return Err(StartFailure::NothingRunning(eyre!(
+                "failed to start command '{}' in {}: {err}",
+                config.cmd,
+                expanded
+            )));
         }
     };
 
@@ -61,51 +108,68 @@ pub fn start_project(
     wait_for_startup(name, config, project_dir, pid, &mut child)?;
 
     state.add(name.to_string(), pid, config.port);
-    state.save()?;
+    if let Err(err) = state.save() {
+        // The project is running but untrackable on disk — nothing could
+        // stop it later — so undo the start instead of leaking it.
+        state.remove(name);
+        return Err(match kill_process_group(pid) {
+            Ok(_) => {
+                let _ = logs::remove_project_log(name);
+                StartFailure::NothingRunning(eyre!(
+                    "failed to persist state for '{name}'; \
+                     stopped the just-started process (pid {pid}): {err:#}"
+                ))
+            }
+            Err(stop_err) => {
+                // The process may still be running; keep the log, the only
+                // record of what it was doing, and say so honestly.
+                let log_note = match logs::project_log_path(name) {
+                    Ok(path) => format!("log kept at {}", path.display()),
+                    Err(_) => "log kept".to_string(),
+                };
+                StartFailure::MaybeRunning {
+                    pid,
+                    err: eyre!(
+                        "could not stop the just-started process (pid {pid}): {stop_err:#} \
+                         — it may still be running; {log_note}. \
+                         Additionally, persisting state failed: {err}"
+                    ),
+                }
+            }
+        });
+    }
 
     Ok(pid)
 }
 
-pub fn stop_project(name: &str, state: &mut AppState) -> eyre::Result<()> {
-    if !state.processes.contains_key(name) {
-        bail!("project '{}' is not running", name);
-    }
+/// Stop the project if anything is still running. Err means a live process
+/// group could not be cleared (no permission, refusal to die, or a state
+/// write failure); every timing in which the process dies on its own is Ok.
+pub fn stop_project_if_running(name: &str, state: &mut AppState) -> eyre::Result<StopOutcome> {
+    let Some(ps) = state.processes.get(name) else {
+        return Ok(StopOutcome::AlreadyDead);
+    };
+    let pid = ps.pid;
 
-    let pid = state.processes[name].pid;
-
-    if !crate::state::is_process_group_alive(pid) {
-        state.remove(name);
-        state.save()?;
-        bail!(
-            "project '{}' process group (pid {}) is no longer alive",
-            name,
-            pid
-        );
-    }
-
-    // Kill the entire process group (negative PID sends to group)
-    kill_process_group(pid)?;
+    let outcome = kill_process_group(pid)?;
 
     state.remove(name);
     state.save()?;
-    Ok(())
+    Ok(outcome)
 }
 
-fn kill_process_group(pid: u32) -> eyre::Result<()> {
+pub fn stop_project(name: &str, state: &mut AppState) -> eyre::Result<()> {
+    match stop_project_if_running(name, state)? {
+        StopOutcome::Killed { .. } => Ok(()),
+        StopOutcome::AlreadyDead => bail!("project '{name}' is not running"),
+    }
+}
+
+fn kill_process_group(pid: u32) -> eyre::Result<StopOutcome> {
     // First try SIGTERM to the process group
-    unsafe {
-        let ret = libc::kill(-(pid as i32), libc::SIGTERM);
-        if ret != 0 {
-            // If killing the group fails, try killing just the process
-            let ret = libc::kill(pid as i32, libc::SIGTERM);
-            if ret != 0 {
-                bail!(
-                    "failed to send SIGTERM to process {}: {}",
-                    pid,
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
+    if !signal_delivered(pid, libc::SIGTERM)? {
+        // ESRCH: the group is already gone, which is a completed stop.
+        return Ok(StopOutcome::AlreadyDead);
     }
 
     // Give the process a moment to shut down gracefully
@@ -113,13 +177,112 @@ fn kill_process_group(pid: u32) -> eyre::Result<()> {
 
     // Check if still alive, force kill if necessary
     if crate::state::is_process_group_alive(pid) {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
+        // It may exit between the check and the SIGKILL; that still counts
+        // as stopped by us. Only a group that refuses to die is an error,
+        // reported by wait_until_group_gone below.
+        let _ = signal_delivered(pid, libc::SIGKILL);
+        wait_until_group_gone(pid)?;
     }
 
-    Ok(())
+    Ok(StopOutcome::Killed { pid })
+}
+
+/// Send `sig` to the process group, falling back to the leader alone.
+/// Ok(false) means no signalable target exists — both the group and the
+/// leader are gone (ESRCH) — which is nothing left to stop, not a failure.
+fn signal_delivered(pid: u32, sig: i32) -> eyre::Result<bool> {
+    let (group_ret, group_err) = unsafe {
+        let ret = libc::kill(-(pid as i32), sig);
+        (ret, std::io::Error::last_os_error())
+    };
+    if group_ret == 0 {
+        return Ok(true);
+    }
+
+    let leader_ret = unsafe { libc::kill(pid as i32, sig) };
+    if leader_ret == 0 {
+        return Ok(true);
+    }
+
+    // The leader is a group member, so when the group itself is gone (ESRCH)
+    // the leader's errno decides. Any other group failure means the group
+    // exists but cannot be signaled, and must not be mistaken for absence.
+    let leader_err = std::io::Error::last_os_error();
+    let decisive = if group_err.raw_os_error() == Some(libc::ESRCH) {
+        leader_err
+    } else {
+        group_err
+    };
+    match decisive.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(decisive).wrap_err_with(|| format!("failed to signal process {pid}")),
+    }
+}
+
+/// Block until the process group is gone. Returning from a stop before death
+/// is confirmed lets a follow-up start's readiness probe attribute the old
+/// listener to a foreign process group and kill the new one.
+fn wait_until_group_gone(pid: u32) -> eyre::Result<()> {
+    let deadline = Instant::now() + DEATH_CONFIRM_TIMEOUT;
+    loop {
+        std::thread::sleep(DEATH_POLL_INTERVAL);
+
+        if !crate::state::is_process_group_alive(pid) {
+            return Ok(());
+        }
+
+        // Zombies cannot execute or hold any resource, and only their
+        // parent can reap them; if nothing else lives in the group, it is
+        // dead enough.
+        if group_has_only_zombies(pid) {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "process group {pid} did not exit within {DEATH_CONFIRM_TIMEOUT:?} of \
+                 SIGKILL — it may be stuck in uninterruptible I/O"
+            );
+        }
+    }
+}
+
+/// Whether every remaining member of the process group is a zombie. Unreaped
+/// zombies keep kill(-pgid, 0) succeeding (macOS even answers EPERM) while
+/// holding no resources, but live members can remain alongside a zombie
+/// leader, so the whole group is inspected. Conservative on any doubt: a
+/// failed, empty, or unparseable listing reports `false` so the caller keeps
+/// waiting for its timeout instead of vacuously confirming death.
+fn group_has_only_zombies(group_id: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-o", "pgid=,stat="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    // kill(-pgid, 0) said the group exists, so a listing without a single
+    // matching row is not trustworthy either.
+    let mut saw_member = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(pgid), Some(stat)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !pgid.parse::<u32>().is_ok_and(|pgid| pgid == group_id) {
+            continue;
+        }
+        saw_member = true;
+        if !stat.starts_with('Z') {
+            return false;
+        }
+    }
+    saw_member
 }
 
 pub fn describe_readiness(config: &ProjectConfig) -> String {
@@ -132,13 +295,29 @@ pub fn describe_readiness(config: &ProjectConfig) -> String {
     }
 }
 
+/// Kill a just-started group whose startup is being abandoned, and classify
+/// the failure by whether its termination could be confirmed.
+fn abort_startup(name: &str, group_id: u32, message: String) -> StartFailure {
+    let base = startup_failure(name, message);
+    match kill_process_group(group_id) {
+        Ok(_) => StartFailure::NothingRunning(base),
+        Err(stop_err) => StartFailure::MaybeRunning {
+            pid: group_id,
+            err: eyre!(
+                "could not confirm termination of the just-started process: {stop_err:#} \
+                 — it may still be running. {base:#}"
+            ),
+        },
+    }
+}
+
 fn wait_for_startup(
     name: &str,
     config: &ProjectConfig,
     project_dir: &Path,
     group_id: u32,
     child: &mut Child,
-) -> eyre::Result<()> {
+) -> Result<(), StartFailure> {
     if config.ready_cmd.is_none() && config.port.is_none() {
         return Ok(());
     }
@@ -147,50 +326,56 @@ fn wait_for_startup(
     let deadline = Instant::now() + timeout;
 
     loop {
-        if let Some(status) = child.try_wait()? {
+        let status = child.try_wait().map_err(|err| {
+            abort_startup(
+                name,
+                group_id,
+                format!("failed to poll project status: {err}"),
+            )
+        })?;
+        if let Some(status) = status {
             if !crate::state::is_process_group_alive(group_id) {
-                return Err(startup_failure(
+                return Err(StartFailure::NothingRunning(startup_failure(
                     name,
                     format!(
                         "project exited before becoming ready{}",
                         format_exit_status(Some(&status))
                     ),
-                ));
+                )));
             }
         }
 
         if !crate::state::is_process_group_alive(group_id) {
-            return Err(startup_failure(
+            return Err(StartFailure::NothingRunning(startup_failure(
                 name,
                 format!(
                     "project exited before becoming ready{}",
                     format_exit_status(None)
                 ),
-            ));
+            )));
         }
 
         let now = Instant::now();
         if now >= deadline {
-            if crate::state::is_process_group_alive(group_id) {
-                let _ = kill_process_group(group_id);
-            }
-            return Err(startup_failure(
+            return Err(abort_startup(
                 name,
+                group_id,
                 format!("startup timed out after {}ms", config.startup_timeout_ms),
             ));
         }
 
         let remaining = deadline.saturating_duration_since(now);
         let probe_timeout = remaining.min(READY_CMD_TIMEOUT_CAP);
-        match readiness_probe_passed(config, project_dir, probe_timeout, group_id)? {
+        let probe = readiness_probe_passed(config, project_dir, probe_timeout, group_id).map_err(
+            |err| abort_startup(name, group_id, format!("readiness probe failed: {err:#}")),
+        )?;
+        match probe {
             ProbeOutcome::Ready => return Ok(()),
             ProbeOutcome::NotYet => {}
             ProbeOutcome::ForeignListener { port, pid, command } => {
-                if crate::state::is_process_group_alive(group_id) {
-                    let _ = kill_process_group(group_id);
-                }
-                return Err(startup_failure(
+                return Err(abort_startup(
                     name,
+                    group_id,
                     format!(
                         "port {port} is held by pid {pid} (`{command}`), which is not part of \
                          this project — another project or a manually started server may \
@@ -201,11 +386,9 @@ fn wait_for_startup(
         }
 
         if Instant::now() >= deadline {
-            if crate::state::is_process_group_alive(group_id) {
-                let _ = kill_process_group(group_id);
-            }
-            return Err(startup_failure(
+            return Err(abort_startup(
                 name,
+                group_id,
                 format!("startup timed out after {}ms", config.startup_timeout_ms),
             ));
         }
@@ -458,6 +641,132 @@ mod tests {
         let mut state = AppState::default();
         let result = stop_project("nonexistent", &mut state);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stop_if_running_without_entry_reports_already_dead() {
+        let mut state = AppState::default();
+        assert_eq!(
+            stop_project_if_running("ghost", &mut state).unwrap(),
+            StopOutcome::AlreadyDead
+        );
+    }
+
+    #[test]
+    fn stop_if_running_cleans_stale_entry() {
+        with_temp_devhub_dir(|| {
+            let mut state = AppState::default();
+            state.add("crashed".to_string(), 99999999, Some(3000));
+
+            assert_eq!(
+                stop_project_if_running("crashed", &mut state).unwrap(),
+                StopOutcome::AlreadyDead
+            );
+            assert!(!state.processes.contains_key("crashed"));
+        });
+    }
+
+    #[test]
+    fn stop_if_running_kills_live_group() {
+        with_temp_devhub_dir(|| {
+            let mut state = AppState::default();
+            let config = ProjectConfig {
+                path: "/tmp".to_string(),
+                cmd: "sleep 30".to_string(),
+                port: None,
+                startup_timeout_ms: 60_000,
+                ready_cmd: None,
+            };
+            let pid = start_project("live", &config, &mut state).unwrap();
+
+            match stop_project_if_running("live", &mut state).unwrap() {
+                StopOutcome::Killed { pid: stopped_pid } => assert_eq!(stopped_pid, pid),
+                outcome => panic!("expected Killed, got {outcome:?}"),
+            }
+            assert!(!state.is_running("live"));
+            let _ = crate::logs::remove_project_log("live");
+        });
+    }
+
+    #[test]
+    fn signal_delivered_reports_missing_target_as_gone() {
+        assert!(!signal_delivered(99999999, libc::SIGTERM).unwrap());
+    }
+
+    #[test]
+    fn zombie_leader_with_live_member_is_not_gone() {
+        let mut leader = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & exec true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        let group_id = leader.id();
+
+        // The leader exits immediately; unreaped, it stays a zombie while
+        // the `sleep 30` member keeps the group alive.
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(crate::state::is_process_group_alive(group_id));
+        assert!(!group_has_only_zombies(group_id));
+
+        let _ = leader.wait();
+        kill_process_group(group_id).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!crate::state::is_process_group_alive(group_id));
+    }
+
+    #[test]
+    fn start_rolls_back_when_state_cannot_be_saved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_devhub_dir(|| {
+            let devhub_dir = crate::dirs::devhub_dir().unwrap();
+            let logs_dir = crate::dirs::logs_dir().unwrap();
+            std::fs::set_permissions(&devhub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let pidfile = std::env::temp_dir()
+                .join(format!("devhub-test-rollback-{}.pid", std::process::id()));
+            let mut state = AppState::default();
+            let config = ProjectConfig {
+                path: "/tmp".to_string(),
+                cmd: format!("echo $$ > {}; sleep 30", pidfile.display()),
+                port: None,
+                startup_timeout_ms: 60_000,
+                // Block startup until the process has written its pid, so
+                // the rollback cannot race ahead of the echo.
+                ready_cmd: Some(format!("test -f {}", pidfile.display())),
+            };
+
+            let result = start_project("leaky", &config, &mut state);
+            std::fs::set_permissions(&devhub_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("failed to persist state"),
+                "error was: {error}"
+            );
+            assert!(
+                error.contains("stopped the just-started process"),
+                "error was: {error}"
+            );
+            assert!(state.processes.is_empty());
+
+            let pid: u32 = std::fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let _ = std::fs::remove_file(&pidfile);
+            assert!(
+                group_has_only_zombies(pid),
+                "the just-started process must be rolled back"
+            );
+            assert!(!logs_dir.join("leaky.log").exists());
+        });
     }
 
     #[test]

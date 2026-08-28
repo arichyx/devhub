@@ -396,6 +396,336 @@ fn stale_inactive_logs_are_cleaned_on_next_command() {
     assert!(fresh.exists());
 }
 
+#[test]
+fn restart_running_project() {
+    let env = TestEnv::new();
+    write_executable(
+        env.project_path(),
+        "ready-service.sh",
+        r#"#!/bin/sh
+echo "booting"
+sleep 1
+touch ready
+echo "ready"
+exec sleep 30
+"#,
+    );
+
+    env.write_config(json!({
+        "worth": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "./ready-service.sh",
+            "startup_timeout_ms": 5000,
+            "ready_cmd": "test -f ready"
+        }
+    }));
+
+    let start = env.run(&["start", "worth"]);
+    assert!(
+        start.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        start.stdout,
+        start.stderr
+    );
+    let old_pid = state_pid(&env, "worth");
+
+    // Reset the readiness marker so the restart exercises a full boot.
+    fs::remove_file(env.project_path().join("ready")).unwrap();
+
+    let restart = env.run(&["restart", "worth"]);
+    assert!(
+        restart.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        restart.stdout,
+        restart.stderr
+    );
+    assert!(restart.stdout.contains("Restarting 'worth'..."));
+    assert!(
+        restart
+            .stdout
+            .contains(&format!("stopped previous run (pid {old_pid})"))
+    );
+    assert!(restart.stdout.contains("readiness:"));
+    assert!(restart.stdout.contains("Restarted."));
+
+    let new_pid = state_pid(&env, "worth");
+    assert_ne!(new_pid, old_pid);
+
+    // The old process group is really gone, not just forgotten in state.
+    unsafe {
+        assert_eq!(
+            libc::kill(-(old_pid as i32), 0),
+            -1,
+            "old process group should be gone"
+        );
+    }
+
+    let status = env.run(&["status"]);
+    assert!(
+        status.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        status.stdout,
+        status.stderr
+    );
+    assert!(status.stdout.contains("running"));
+}
+
+#[test]
+fn restart_stopped_project_starts_it() {
+    let env = TestEnv::new();
+    write_executable(
+        env.project_path(),
+        "ready-service.sh",
+        r#"#!/bin/sh
+echo "booting"
+sleep 1
+touch ready
+echo "ready"
+exec sleep 30
+"#,
+    );
+
+    env.write_config(json!({
+        "worth": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "./ready-service.sh",
+            "startup_timeout_ms": 5000,
+            "ready_cmd": "test -f ready"
+        }
+    }));
+
+    let restart = env.run(&["restart", "worth"]);
+    assert!(
+        restart.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        restart.stdout,
+        restart.stderr
+    );
+    assert!(restart.stdout.contains("not running — starting fresh"));
+    assert!(restart.stdout.contains("Restarted."));
+
+    let state = env.read_state().unwrap();
+    assert!(state.get("worth").is_some(), "state: {state}");
+}
+
+#[test]
+fn restart_shows_leftover_log_from_crashed_run() {
+    let env = TestEnv::new();
+    write_executable(
+        env.project_path(),
+        "ready-service.sh",
+        r#"#!/bin/sh
+echo "booting"
+sleep 1
+touch ready
+echo "ready"
+exec sleep 30
+"#,
+    );
+
+    env.write_config(json!({
+        "worth": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "./ready-service.sh",
+            "startup_timeout_ms": 5000,
+            "ready_cmd": "test -f ready"
+        }
+    }));
+
+    // What devhub sees the morning after an overnight crash: a state entry
+    // whose process is long gone, and the log the crash left behind.
+    fs::create_dir_all(env.devhub_dir().join("logs")).unwrap();
+    fs::write(
+        env.state_path(),
+        json!({
+            "worth": {
+                "pid": 99999999,
+                "started_at": "2026-01-01T00:00:00Z",
+                "port": null
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(env.log_path("worth"), "booting\nfatal: database locked\n").unwrap();
+
+    let restart = env.run(&["restart", "worth"]);
+    assert!(
+        restart.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        restart.stdout,
+        restart.stderr
+    );
+    assert!(restart.stdout.contains("previous run ended on its own"));
+    assert!(restart.stdout.contains("fatal: database locked"));
+    assert!(restart.stdout.contains("Restarted."));
+
+    // The leftover log was replaced by the new run's log.
+    let log = fs::read_to_string(env.log_path("worth")).unwrap();
+    assert!(log.contains("booting"));
+    assert!(!log.contains("database locked"));
+}
+
+#[test]
+fn restart_with_missing_directory_spares_running_process() {
+    let env = TestEnv::new();
+    write_executable(
+        env.project_path(),
+        "sleeper.sh",
+        r#"#!/bin/sh
+exec sleep 30
+"#,
+    );
+
+    env.write_config(json!({
+        "worth": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "./sleeper.sh"
+        }
+    }));
+
+    let start = env.run(&["start", "worth"]);
+    assert!(
+        start.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        start.stdout,
+        start.stderr
+    );
+    let pid = state_pid(&env, "worth");
+
+    // The project directory is moved away while the project runs; the
+    // restart must fail before stopping anything.
+    env.write_config(json!({
+        "worth": {
+            "path": format!("{}/gone", env.project_path().display()),
+            "cmd": "./sleeper.sh"
+        }
+    }));
+
+    let restart = env.run(&["restart", "worth"]);
+    assert!(
+        !restart.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        restart.stdout,
+        restart.stderr
+    );
+    assert!(
+        restart.stderr.contains("does not exist"),
+        "stderr: {}",
+        restart.stderr
+    );
+
+    // The running process was not collateral damage.
+    let state = env.read_state().unwrap();
+    assert_eq!(state.get("worth").unwrap().get("pid").unwrap(), pid);
+    unsafe {
+        assert_eq!(libc::kill(pid as i32, 0), 0, "process should be alive");
+    }
+}
+
+#[test]
+fn failed_restart_leaves_project_stopped_and_drops_route() {
+    let env = TestEnv::new();
+    let port = reserve_port();
+
+    fs::write(
+        env.project_path().join("tcp_service.py"),
+        r#"import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+print("booting", flush=True)
+time.sleep(1)
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", port))
+sock.listen()
+print("listening", flush=True)
+time.sleep(30)
+"#,
+    )
+    .unwrap();
+
+    env.write_config(json!({
+        "api": {
+            "path": env.project_path().display().to_string(),
+            "cmd": format!("python3 -u ./tcp_service.py {port}"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+
+    let start = env.run(&["start", "api"]);
+    assert!(
+        start.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        start.stdout,
+        start.stderr
+    );
+    assert!(env.caddyfile_path().exists());
+
+    // The project now crashes on boot.
+    write_executable(
+        env.project_path(),
+        "broken.sh",
+        r#"#!/bin/sh
+echo "booting"
+echo "fatal: boom" >&2
+exit 7
+"#,
+    );
+    env.write_config(json!({
+        "api": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "./broken.sh",
+            "port": port,
+            "startup_timeout_ms": 3000
+        }
+    }));
+
+    let restart = env.run(&["restart", "api"]);
+    assert!(
+        !restart.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        restart.stdout,
+        restart.stderr
+    );
+    assert!(
+        restart.stderr.contains("restart failed"),
+        "stderr: {}",
+        restart.stderr
+    );
+    assert!(
+        restart.stderr.contains("now stopped"),
+        "stderr: {}",
+        restart.stderr
+    );
+    assert!(
+        restart.stderr.contains("fatal: boom"),
+        "stderr: {}",
+        restart.stderr
+    );
+
+    let state = env.read_state().unwrap_or_else(|| json!({}));
+    assert_eq!(state, json!({}));
+    assert!(!env.log_path("api").exists());
+    assert!(
+        !env.caddyfile_path().exists(),
+        "route must be dropped when a restart leaves the project stopped"
+    );
+}
+
+fn state_pid(env: &TestEnv, name: &str) -> u64 {
+    let state = env.read_state().unwrap_or_else(|| json!({}));
+    state
+        .get(name)
+        .unwrap_or_else(|| panic!("no state entry for '{name}': {state}"))
+        .get("pid")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("no pid in state entry for '{name}': {state}"))
+}
+
 fn write_executable(dir: &Path, name: &str, contents: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, contents).unwrap();

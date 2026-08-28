@@ -3,7 +3,7 @@
 This document explains how `devhub` works as a whole:
 
 - where project definitions live
-- how `start`, `status`, and `stop` work
+- how `start`, `status`, `stop`, and `restart` work
 - how runtime state is stored
 - how local proxy routes are derived from that state
 - why Unix process groups are the core abstraction
@@ -145,6 +145,7 @@ The log lifecycle is intentionally simple:
 
 - on successful start, the log stays while the service runs
 - on `stop`, the log is deleted
+- on `restart`, if the previous run ended on its own, its log tail is printed before the fresh start truncates it — otherwise the only record of why it died would be lost
 - on startup failure, `devhub` prints the tail of the log and deletes it immediately
 - on later commands, inactive logs older than one day are cleaned up automatically
 
@@ -343,10 +344,10 @@ devhub stop worth
 The flow is:
 
 1. Load state and find the recorded group identifier for `worth`.
-2. Probe whether that process group still exists.
-3. Send `SIGTERM` to the whole group.
-4. Wait 100ms.
-5. If the group still exists, send `SIGKILL` to the whole group.
+2. Send `SIGTERM` to the whole group. If the group no longer exists, the stop is already complete.
+3. Wait 100ms.
+4. If the group still exists, send `SIGKILL` to the whole group.
+5. Wait until the group is confirmed gone (a short bounded poll; a group reduced to unreaped zombies counts as gone, since a zombie holds no resources, but any live member keeps the wait going).
 6. Remove `worth` from `state.json`.
 7. Delete `~/.devhub/logs/worth.log`.
 8. Reconcile Caddy so the route disappears.
@@ -354,6 +355,27 @@ The flow is:
 Why terminate the group instead of just one PID?
 
 Because the top-level command may have spawned several layers. `stop` should bring down the whole project tree, not only one wrapper process.
+
+At the lowest level, a stop only fails when a live group cannot be cleared: a signal is refused, or the group survives `SIGKILL` (for example, stuck in uninterruptible I/O). A group that turns out to be already gone is nothing to clear, so the internal stop primitive reports it like a completed stop — `restart` relies on this to pull a crashed project back up without a spurious error. The `stop` command itself keeps stricter user-facing behavior: stopping a project that is not running reports `project is not running`, and a group that dies mid-stop is removed from state before that error is raised.
+
+## Flow of `devhub restart <name>`
+
+Suppose you run:
+
+```bash
+devhub restart worth
+```
+
+The flow is:
+
+1. Load config and state, prune dead entries, clean old logs, reconcile Caddy (the usual preamble).
+2. Preflight: verify `worth` exists in `proj.json` and that its directory exists — before stopping anything, so a config typo or a moved directory cannot take down a healthy running process.
+3. If `worth` is running, stop its group exactly as `stop` does and delete the log.
+4. If it is not running, start fresh. When a leftover log from a run that ended on its own is present, its tail is printed first, because the fresh start would otherwise truncate the only record of why it died.
+5. Start the project through the same readiness-checked path as `start`.
+6. Reconcile Caddy once at the end: with the route content unchanged the reconcile is a no-op, so `worth.localhost` briefly returns 502 while the new process boots instead of the route disappearing and coming back; if the start failed, the route is dropped instead.
+
+A failed start leaves the project stopped — a killed process cannot be resurrected — and the error says so explicitly. In the rare case where even the cleanup kill cannot confirm the process died, the error instead says it may still be running and names the pid, so a live process is never declared stopped.
 
 ## Flow of Caddy reconciliation
 

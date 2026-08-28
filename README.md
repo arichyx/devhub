@@ -98,6 +98,20 @@ Stopping 'worth'...
 Stopped.
 ```
 
+```
+$ devhub restart worth
+
+Restarting 'worth'...
+  stopped previous run (pid 93128)
+  log:  /Users/you/.devhub/logs/worth.log
+  readiness:  exec `curl -fsS http://127.0.0.1:13001/healthz`
+  pid:  93131
+  url:  http://worth.localhost (→ localhost:13001)
+Restarted.
+```
+
+Restarting a project that is not running just starts it, so `restart` also works as "pull my crashed project back up". If the previous run ended on its own, the tail of its log is printed before the fresh start replaces it.
+
 ## How it works
 
 - **Config & state** live in `~/.devhub/`:
@@ -114,7 +128,8 @@ Stopped.
 - `devhub start` waits for readiness instead of treating `spawn()` as success. If `ready_cmd` is set, it is polled until it exits `0`; otherwise, a project with `port` uses a TCP readiness probe against `127.0.0.1:<port>`.
 - The TCP probe verifies the listener on `port` belongs to the project's own process group. If an unrelated process holds the port (a stale server, a manually started dev server), the start fails immediately and names the offending PID instead of letting that process answer the probe and receive the project's proxy route. Ports must also be unique across projects — a config that declares the same port twice is rejected at load time.
 - During startup and runtime, project `stdout`/`stderr` are written to `~/.devhub/logs/<name>.log`.
-- On `stop`, the entire process group receives `SIGTERM` (then `SIGKILL` if it doesn't exit within 100ms).
+- On `stop`, the entire process group receives `SIGTERM` (then `SIGKILL` if it doesn't exit within 100ms); the stop returns only after the group is confirmed gone. Stopping a project that is not running is an error, but a group that dies mid-stop is still removed from state first.
+- `restart` preflights the config before stopping anything, then stops the project (if running) and starts it again through the same readiness-checked path. The proxy route is kept across the restart — the URL briefly 502s instead of disappearing — and if the new start fails, the route is dropped and the error states whether the project is stopped or may still be running.
 - Stale entries (PIDs that are no longer alive) are **automatically pruned** on every command.
 - Failed starts print the tail of the startup log and then delete that log. Successful project logs are deleted on `stop`, and inactive logs older than one day are cleaned up automatically on later commands.
 - Projects with a `port` field get a Caddy reverse proxy entry at `http://<name>.localhost → localhost:<port>`. The gateway listens on the standard HTTP port 80 (macOS allows unprivileged binding), so project URLs carry no port. Caddy is reloaded (or started) automatically; if port 80 is already held by another process, the error names the offending PID.
