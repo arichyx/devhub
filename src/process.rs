@@ -16,6 +16,9 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const READY_CMD_TIMEOUT_CAP: Duration = Duration::from_secs(1);
 const DEATH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const DEATH_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// `ps -A` is far costlier than the kill(0) probe, so the zombie check
+/// behind it runs at a slower cadence during long waits.
+const ZOMBIE_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// What a stop request found and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +123,7 @@ pub fn start_project(
     };
 
     let pid = child.id();
+    let grace = Duration::from_millis(config.stop_timeout_ms);
 
     // Record the group before waiting for readiness: an entry written only
     // afterwards is lost if devhub dies mid-wait, leaving the project
@@ -127,7 +131,10 @@ pub fn start_project(
     let claimed = state.update(|s| match s.live(name) {
         Some(other) => Err(already_started(name, other)),
         None => {
-            s.add(name.to_string(), ProcessState::starting(pid, config.port));
+            s.add(
+                name.to_string(),
+                ProcessState::starting(pid, config.port, config.stop_timeout_ms),
+            );
             Ok(())
         }
     });
@@ -136,7 +143,7 @@ pub fn start_project(
         // A concurrent `devhub start` of the same project claimed it first;
         // its log is the one now in use, so only our group is discarded.
         Ok(Err(conflict)) => {
-            return Err(match kill_process_group(pid) {
+            return Err(match kill_process_group(pid, grace) {
                 Ok(_) => StartFailure::NothingRunning(conflict),
                 Err(stop_err) => StartFailure::MaybeRunning {
                     pid,
@@ -146,7 +153,7 @@ pub fn start_project(
         }
         Err(err) => {
             state.remove_if_pid(name, pid);
-            return Err(rollback_untracked_start(name, pid, err));
+            return Err(rollback_untracked_start(name, pid, grace, err));
         }
     }
 
@@ -163,7 +170,7 @@ pub fn start_project(
 
     if let Err(err) = state.update(|s| s.mark_ready(name, pid)) {
         state.remove_if_pid(name, pid);
-        return Err(rollback_untracked_start(name, pid, err));
+        return Err(rollback_untracked_start(name, pid, grace, err));
     }
 
     Ok(pid)
@@ -176,8 +183,13 @@ fn already_started(name: &str, ps: &ProcessState) -> eyre::Report {
 
 /// Undo a start whose state could not be persisted: the project is running
 /// but nothing could find it later, so it must not be leaked.
-fn rollback_untracked_start(name: &str, pid: u32, err: eyre::Report) -> StartFailure {
-    match kill_process_group(pid) {
+fn rollback_untracked_start(
+    name: &str,
+    pid: u32,
+    grace: Duration,
+    err: eyre::Report,
+) -> StartFailure {
+    match kill_process_group(pid, grace) {
         Ok(_) => {
             let _ = logs::remove_project_log(name);
             StartFailure::NothingRunning(eyre!(
@@ -215,7 +227,7 @@ pub fn stop_project_if_running(name: &str, state: &mut AppState) -> eyre::Result
 
     // Never signal a group whose pid now belongs to an unrelated process.
     let outcome = if ps.is_alive() {
-        kill_process_group(pid)?
+        kill_process_group(pid, ps.stop_grace())?
     } else {
         StopOutcome::AlreadyDead
     };
@@ -231,23 +243,27 @@ pub fn stop_project(name: &str, state: &mut AppState) -> eyre::Result<()> {
     }
 }
 
-fn kill_process_group(pid: u32) -> eyre::Result<StopOutcome> {
-    // First try SIGTERM to the process group
+/// SIGTERM the group, give it up to `grace` to shut down, and SIGKILL it
+/// only if it is still there. Returns as soon as the group is gone, so a
+/// generous grace period costs nothing for projects that exit promptly.
+fn kill_process_group(pid: u32, grace: Duration) -> eyre::Result<StopOutcome> {
     if !signal_delivered(pid, libc::SIGTERM)? {
         // ESRCH: the group is already gone, which is a completed stop.
         return Ok(StopOutcome::AlreadyDead);
     }
 
-    // Give the process a moment to shut down gracefully
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    if wait_until_group_gone(pid, grace) {
+        return Ok(StopOutcome::Killed { pid });
+    }
 
-    // Check if still alive, force kill if necessary
-    if crate::state::is_process_group_alive(pid) {
-        // It may exit between the check and the SIGKILL; that still counts
-        // as stopped by us. Only a group that refuses to die is an error,
-        // reported by wait_until_group_gone below.
-        let _ = signal_delivered(pid, libc::SIGKILL);
-        wait_until_group_gone(pid)?;
+    // It may exit between the wait and the SIGKILL; that still counts as
+    // stopped by us. Only a group that survives SIGKILL is an error.
+    let _ = signal_delivered(pid, libc::SIGKILL);
+    if !wait_until_group_gone(pid, DEATH_CONFIRM_TIMEOUT) {
+        bail!(
+            "process group {pid} did not exit within {DEATH_CONFIRM_TIMEOUT:?} of \
+             SIGKILL — it may be stuck in uninterruptible I/O"
+        );
     }
 
     Ok(StopOutcome::Killed { pid })
@@ -285,30 +301,33 @@ fn signal_delivered(pid: u32, sig: i32) -> eyre::Result<bool> {
     }
 }
 
-/// Block until the process group is gone. Returning from a stop before death
-/// is confirmed lets a follow-up start's readiness probe attribute the old
-/// listener to a foreign process group and kill the new one.
-fn wait_until_group_gone(pid: u32) -> eyre::Result<()> {
-    let deadline = Instant::now() + DEATH_CONFIRM_TIMEOUT;
+/// Wait up to `timeout` for the process group to be gone; true once it is.
+/// Returning from a stop before death is confirmed lets a follow-up start's
+/// readiness probe attribute the old listener to a foreign process group
+/// and kill the new one.
+fn wait_until_group_gone(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut next_zombie_check = Instant::now();
     loop {
         std::thread::sleep(DEATH_POLL_INTERVAL);
 
         if !crate::state::is_process_group_alive(pid) {
-            return Ok(());
+            return true;
         }
 
         // Zombies cannot execute or hold any resource, and only their
         // parent can reap them; if nothing else lives in the group, it is
         // dead enough.
-        if group_has_only_zombies(pid) {
-            return Ok(());
+        let now = Instant::now();
+        if now >= next_zombie_check {
+            if group_has_only_zombies(pid) {
+                return true;
+            }
+            next_zombie_check = now + ZOMBIE_CHECK_INTERVAL;
         }
 
-        if Instant::now() >= deadline {
-            bail!(
-                "process group {pid} did not exit within {DEATH_CONFIRM_TIMEOUT:?} of \
-                 SIGKILL — it may be stuck in uninterruptible I/O"
-            );
+        if now >= deadline {
+            return false;
         }
     }
 }
@@ -355,7 +374,12 @@ pub fn describe_readiness(config: &ProjectConfig) -> String {
     if let Some(cmd) = &config.ready_cmd {
         format!("exec `{cmd}`")
     } else if let Some(port) = config.port {
-        format!("tcp localhost:{port} (127.0.0.1 or ::1, listener ownership verified)")
+        let ownership = if config.verify_port_owner {
+            "verified"
+        } else {
+            "not verified"
+        };
+        format!("tcp localhost:{port} (127.0.0.1 or ::1, listener ownership {ownership})")
     } else {
         "none (spawn only)".to_string()
     }
@@ -363,9 +387,9 @@ pub fn describe_readiness(config: &ProjectConfig) -> String {
 
 /// Kill a just-started group whose startup is being abandoned, and classify
 /// the failure by whether its termination could be confirmed.
-fn abort_startup(name: &str, group_id: u32, message: String) -> StartFailure {
+fn abort_startup(name: &str, group_id: u32, grace: Duration, message: String) -> StartFailure {
     let base = startup_failure(name, message);
-    match kill_process_group(group_id) {
+    match kill_process_group(group_id, grace) {
         Ok(_) => StartFailure::NothingRunning(base),
         Err(stop_err) => StartFailure::MaybeRunning {
             pid: group_id,
@@ -384,7 +408,8 @@ fn wait_for_startup(
     group_id: u32,
     child: &mut Child,
 ) -> Result<(), StartFailure> {
-    let interrupted = || abort_startup(name, group_id, "startup interrupted".to_string());
+    let grace = Duration::from_millis(config.stop_timeout_ms);
+    let interrupted = || abort_startup(name, group_id, grace, "startup interrupted".to_string());
 
     if config.ready_cmd.is_none() && config.port.is_none() {
         if interrupt_received() {
@@ -409,6 +434,7 @@ fn wait_for_startup(
             abort_startup(
                 name,
                 group_id,
+                grace,
                 format!("failed to poll project status: {err}"),
             )
         })?;
@@ -427,6 +453,7 @@ fn wait_for_startup(
             return Err(abort_startup(
                 name,
                 group_id,
+                grace,
                 format!("startup timed out after {}ms", config.startup_timeout_ms),
             ));
         }
@@ -434,7 +461,7 @@ fn wait_for_startup(
         let remaining = deadline.saturating_duration_since(now);
         let probe_timeout = remaining.min(READY_CMD_TIMEOUT_CAP);
         let probe = readiness_probe_passed(config, project_dir, probe_timeout, group_id).map_err(
-            |err| abort_startup(name, group_id, format!("readiness probe failed: {err:#}")),
+            |err| abort_startup(name, group_id, grace, format!("readiness probe failed: {err:#}")),
         )?;
         // Ctrl-C also reaches the probe's own helpers (ready_cmd, lsof), and a
         // killed lsof reads as "listener not attributable"; never let an
@@ -449,6 +476,7 @@ fn wait_for_startup(
                 return Err(abort_startup(
                     name,
                     group_id,
+                    grace,
                     format!(
                         "port {port} is held by pid {pid} (`{command}`), which is not part of \
                          this project — another project or a manually started server may \
@@ -462,6 +490,7 @@ fn wait_for_startup(
             return Err(abort_startup(
                 name,
                 group_id,
+                grace,
                 format!("startup timed out after {}ms", config.startup_timeout_ms),
             ));
         }
@@ -493,13 +522,13 @@ fn readiness_probe_passed(
         // A ready_cmd cannot tell *who* answered; when a port is also
         // configured, require the listener to be ours before declaring ready.
         return Ok(match config.port {
-            Some(port) => port_readiness(port, group_id),
+            Some(port) => port_readiness(port, group_id, config.verify_port_owner),
             None => ProbeOutcome::Ready,
         });
     }
 
     if let Some(port) = config.port {
-        return Ok(port_readiness(port, group_id));
+        return Ok(port_readiness(port, group_id, config.verify_port_owner));
     }
 
     Ok(ProbeOutcome::Ready)
@@ -508,10 +537,15 @@ fn readiness_probe_passed(
 /// Probe `port` and, once something is listening, verify the listener belongs
 /// to the project's process group. Without the ownership check any unrelated
 /// listener (a stale server, another project on the same port) would satisfy
-/// the probe and silently receive this project's Caddy route.
-fn port_readiness(port: u16, group_id: u32) -> ProbeOutcome {
-    if !tcp_readiness_probe(port) {
+/// the probe and silently receive this project's Caddy route. With
+/// `verify_owner` off (the port is held by e.g. Docker's forwarder, outside
+/// the group), any listener counts.
+fn port_readiness(port: u16, group_id: u32, verify_owner: bool) -> ProbeOutcome {
+    if !loopback_accepts(port) {
         return ProbeOutcome::NotYet;
+    }
+    if !verify_owner {
+        return ProbeOutcome::Ready;
     }
 
     let Some(pids) = listening_pids(port) else {
@@ -559,6 +593,17 @@ pub(crate) fn listening_pids(port: u16) -> Option<Vec<u32>> {
     }
 }
 
+/// Full command line of `pid`, or `None` if it is already gone.
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !command.is_empty()).then_some(command)
+}
+
 /// Process group id and command name of `pid`, or `None` if it is already gone.
 pub(crate) fn listener_details(pid: u32) -> Option<(u32, String)> {
     let output = Command::new("ps")
@@ -600,7 +645,7 @@ fn exec_readiness_probe(cmd: &str, project_dir: &Path, timeout: Duration) -> eyr
 /// address. Dev servers bound to `localhost` often listen on one family
 /// only (Node 17+ resolves localhost to ::1 on macOS), and the proxy's
 /// `localhost` upstream reaches either.
-fn tcp_readiness_probe(port: u16) -> bool {
+pub(crate) fn loopback_accepts(port: u16) -> bool {
     [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]
         .into_iter()
         .any(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), TCP_CONNECT_TIMEOUT).is_ok())
@@ -705,6 +750,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let pid = start_project("test-sleep", &config, &mut state).unwrap();
@@ -727,6 +774,8 @@ mod tests {
             port: None,
             startup_timeout_ms: 60_000,
             ready_cmd: None,
+            stop_timeout_ms: 5_000,
+            verify_port_owner: true,
         };
 
         let result = start_project("bad-path", &config, &mut state);
@@ -744,6 +793,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let _pid = start_project("dup", &config, &mut state).unwrap();
@@ -781,7 +832,7 @@ mod tests {
             let mut state = AppState::default();
             state.add(
                 "crashed".to_string(),
-                ProcessState::starting(99999999, Some(3000)),
+                ProcessState::starting(99999999, Some(3000), 5_000),
             );
 
             assert_eq!(
@@ -802,6 +853,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
             let pid = start_project("live", &config, &mut state).unwrap();
 
@@ -840,7 +893,7 @@ mod tests {
         assert!(!group_has_only_zombies(group_id));
 
         let _ = leader.wait();
-        kill_process_group(group_id).unwrap();
+        kill_process_group(group_id, Duration::from_secs(5)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!crate::state::is_process_group_alive(group_id));
     }
@@ -863,6 +916,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let result = start_project("leaky", &config, &mut state);
@@ -903,6 +958,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let pid = start_project("session", &config, &mut state).unwrap();
@@ -926,6 +983,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 60_000,
                 ready_cmd: Some("true".to_string()),
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let pid = start_project("recorded", &config, &mut state).unwrap();
@@ -953,7 +1012,7 @@ mod tests {
                 "gone".to_string(),
                 ProcessState {
                     leader_started: Some("Mon Jan  1 00:00:00 2001".to_string()),
-                    ..ProcessState::starting(bystander.id(), None)
+                    ..ProcessState::starting(bystander.id(), None, 5_000)
                 },
             );
 
@@ -988,7 +1047,7 @@ mod tests {
         assert!(!crate::state::is_pid_alive(group_id));
         assert!(crate::state::is_process_group_alive(group_id));
 
-        kill_process_group(group_id).unwrap();
+        kill_process_group(group_id, Duration::from_secs(5)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         assert!(!crate::state::is_process_group_alive(group_id));
@@ -998,7 +1057,7 @@ mod tests {
     fn tcp_probe_detects_open_listener() {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert!(tcp_readiness_probe(port));
+        assert!(loopback_accepts(port));
     }
 
     #[test]
@@ -1008,7 +1067,7 @@ mod tests {
             return;
         };
         let port = listener.local_addr().unwrap().port();
-        assert!(tcp_readiness_probe(port));
+        assert!(loopback_accepts(port));
     }
 
     #[test]
@@ -1026,6 +1085,8 @@ mod tests {
                 port: Some(port),
                 startup_timeout_ms: 5_000,
                 ready_cmd: None,
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let error = start_project("foreign-port", &config, &mut state).unwrap_err();
@@ -1053,6 +1114,8 @@ mod tests {
             port: Some(3000),
             startup_timeout_ms: 60_000,
             ready_cmd: Some("curl -f http://127.0.0.1:3000/healthz".to_string()),
+            stop_timeout_ms: 5_000,
+            verify_port_owner: true,
         };
 
         assert_eq!(
@@ -1071,6 +1134,8 @@ mod tests {
                 port: None,
                 startup_timeout_ms: 300,
                 ready_cmd: Some("sleep 5".to_string()),
+                stop_timeout_ms: 5_000,
+                verify_port_owner: true,
             };
 
             let started = Instant::now();

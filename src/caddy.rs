@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -5,13 +6,22 @@ use std::time::Duration;
 use eyre::{WrapErr, eyre};
 
 use crate::dirs;
+use crate::logs;
 use crate::state::AppState;
 
 const CADDY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The gateway listens on the standard HTTP port so project URLs stay
 /// port-free (`http://<name>.localhost`).
-const PROXY_PORT: u16 = 80;
+const DEFAULT_HTTP_PORT: u16 = 80;
+
+/// devhub's caddy gets its own admin endpoint instead of caddy's default
+/// `localhost:2019`, so `caddy reload`/`stop` can never reconfigure or stop
+/// a caddy the user runs for something else.
+const DEFAULT_ADMIN_PORT: u16 = 12019;
+
+/// Lines of caddy's own output quoted in a start failure.
+const CADDY_OUTPUT_LINES: usize = 5;
 
 /// The `caddy` binary is not on PATH. Kept distinct so routine reconciles can
 /// stay quiet about it; `start` and `stop` still warn.
@@ -28,6 +38,41 @@ impl std::error::Error for CaddyNotInstalled {}
 
 pub fn is_not_installed(err: &eyre::Report) -> bool {
     err.downcast_ref::<CaddyNotInstalled>().is_some()
+}
+
+/// `DEVHUB_CADDY_ADMIN_PORT` overrides the admin port, e.g. when 12019 is
+/// taken or to point tests at a stand-in.
+fn admin_port() -> u16 {
+    std::env::var("DEVHUB_CADDY_ADMIN_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(DEFAULT_ADMIN_PORT)
+}
+
+fn admin_address() -> String {
+    format!("localhost:{}", admin_port())
+}
+
+/// `DEVHUB_HTTP_PORT` moves the gateway off port 80, e.g. where binding it
+/// needs privileges (Linux) or to keep tests off the machine's real gateway.
+fn http_port() -> u16 {
+    std::env::var("DEVHUB_HTTP_PORT")
+        .ok()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(DEFAULT_HTTP_PORT)
+}
+
+pub fn project_url(name: &str) -> String {
+    match http_port() {
+        DEFAULT_HTTP_PORT => format!("http://{name}.localhost"),
+        port => format!("http://{name}.localhost:{port}"),
+    }
+}
+
+/// Whether devhub's caddy is up, judged by its admin endpoint accepting
+/// connections.
+fn caddy_running() -> bool {
+    crate::process::loopback_accepts(admin_port())
 }
 
 pub fn generate_caddyfile(state: &AppState) -> String {
@@ -47,7 +92,11 @@ pub fn generate_caddyfile(state: &AppState) -> String {
         return String::new();
     }
 
-    entries.join("\n\n")
+    let mut global = format!("    admin {}\n", admin_address());
+    if http_port() != DEFAULT_HTTP_PORT {
+        global.push_str(&format!("    http_port {}\n", http_port()));
+    }
+    format!("{{\n{global}}}\n\n{}", entries.join("\n\n"))
 }
 
 pub fn reconcile_caddy(state: &AppState) -> eyre::Result<bool> {
@@ -62,7 +111,11 @@ pub fn reconcile_caddy(state: &AppState) -> eyre::Result<bool> {
         }
     };
 
-    if caddyfile_is_current(&desired, current.as_deref()) {
+    // A matching file only records what was last applied: a caddy that has
+    // since crashed or been stopped leaves every route down with the file
+    // intact.
+    let routes_down = !desired.is_empty() && !caddy_running();
+    if caddyfile_is_current(&desired, current.as_deref()) && !routes_down {
         return Ok(false);
     }
 
@@ -76,7 +129,7 @@ pub fn reload_caddy(state: &AppState) -> eyre::Result<()> {
     if content.is_empty() {
         let path = dirs::caddyfile_path()?;
         if path.exists() {
-            let _ = run_caddy(["stop", "--config", &path.display().to_string()]);
+            let _ = run_caddy(&["stop", "--address", &admin_address()], None);
             std::fs::remove_file(&path)?;
         }
         return Ok(());
@@ -86,7 +139,7 @@ pub fn reload_caddy(state: &AppState) -> eyre::Result<()> {
     std::fs::write(&path, &content)
         .with_context(|| format!("failed to write Caddyfile to {}", path.display()))?;
 
-    let applied = apply_caddyfile(&path);
+    let applied = apply_caddyfile(&path).and_then(|()| check_gateway_is_ours());
     if applied.is_err() {
         // reconcile_caddy treats the on-disk file as the applied config; left
         // in place after a failure, it would look current and never be retried.
@@ -99,37 +152,100 @@ fn apply_caddyfile(path: &Path) -> eyre::Result<()> {
     let config_arg = path.display().to_string();
 
     // Try reload first (works if caddy is already running)
-    if let Ok(true) = run_caddy(["reload", "--config", &config_arg]) {
+    let reload = ["reload", "--config", &config_arg, "--address", &admin_address()];
+    if let Ok(true) = run_caddy(&reload, None) {
         return Ok(());
     }
 
-    // Caddy not running — start it
-    match run_caddy(["start", "--config", &config_arg]) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(eyre!(
-            "caddy failed to start; {}",
-            describe_port_conflict()
-        )),
-        // Spawn failures mean caddy itself is missing; nothing to diagnose.
-        Err(e) => Err(e),
+    // Caddy not running — start it. The server it launches outlives devhub
+    // and keeps writing to caddy.log.
+    let log_path = dirs::caddy_log_path()?;
+    if run_caddy(&["start", "--config", &config_arg], Some(&log_path))? {
+        return Ok(());
     }
+
+    let output = logs::read_log_tail(&log_path).ok().flatten().unwrap_or_default();
+    let mut message = String::from("caddy failed to start");
+    if output.is_empty() || output.contains("address already in use") {
+        message.push_str(&format!("; {}", describe_port_conflict()));
+    }
+    if !output.is_empty() {
+        message.push_str(&format!(
+            "\n\nlast caddy output ({}):\n{}",
+            log_path.display(),
+            last_lines(&output, CADDY_OUTPUT_LINES)
+        ));
+    }
+    Err(eyre!(message))
 }
 
-/// Name the process holding the gateway port when caddy cannot bind it.
-fn describe_port_conflict() -> String {
-    if let Some(pids) = crate::process::listening_pids(PROXY_PORT) {
-        if let Some(pid) = pids.first() {
-            if let Some((_, command)) = crate::process::listener_details(*pid) {
-                if command.contains("caddy") {
-                    return format!(
-                        "an existing caddy instance (pid {pid}) already holds port {PROXY_PORT} — try `caddy stop`"
-                    );
-                }
-                return format!("port {PROXY_PORT} is held by pid {pid} (`{command}`)");
-            }
-        }
+/// Fail if anything besides devhub's caddy listens on the gateway port.
+/// Caddy binds with SO_REUSEPORT, so starting it next to another caddy does
+/// not fail: both listen, and on macOS the instance that bound first keeps
+/// receiving the connections — devhub's routes would silently never be
+/// served.
+fn check_gateway_is_ours() -> eyre::Result<()> {
+    let port = http_port();
+    let (Some(holders), Some(ours)) = (
+        crate::process::listening_pids(port),
+        crate::process::listening_pids(admin_port()),
+    ) else {
+        // Without lsof (or without our admin listener) the owner is unknown.
+        return Ok(());
+    };
+
+    let others: Vec<String> = holders
+        .into_iter()
+        .filter(|pid| !ours.contains(pid))
+        .map(|pid| describe_port_holder(pid, &ours))
+        .collect();
+    if others.is_empty() {
+        return Ok(());
     }
-    format!("check whether port {PROXY_PORT} is already in use")
+    Err(eyre!(
+        "devhub's caddy is running, but port {port} is also held by {}, which may \
+         receive the traffic for *.localhost instead",
+        others.join(" and ")
+    ))
+}
+
+fn last_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
+/// Name what holds the gateway port when caddy cannot bind it.
+fn describe_port_conflict() -> String {
+    let port = http_port();
+    let Some(holders) = crate::process::listening_pids(port) else {
+        return format!("check whether port {port} is already in use");
+    };
+    let ours = crate::process::listening_pids(admin_port()).unwrap_or_default();
+    let holders: Vec<String> = holders
+        .into_iter()
+        .map(|pid| describe_port_holder(pid, &ours))
+        .collect();
+    format!("port {port} is held by {}", holders.join(" and "))
+}
+
+/// `ours` are the pids serving devhub's admin endpoint, i.e. its own caddy.
+fn describe_port_holder(pid: u32, ours: &[u32]) -> String {
+    if ours.contains(&pid) {
+        return format!("devhub's own caddy (pid {pid})");
+    }
+    let command = crate::process::process_command_line(pid).unwrap_or_default();
+    let our_caddyfile = dirs::caddyfile_path()
+        .is_ok_and(|caddyfile| command.contains(caddyfile.to_string_lossy().as_ref()));
+    if our_caddyfile {
+        // Started from devhub's Caddyfile, yet not on devhub's admin
+        // endpoint: left behind by a devhub version that used caddy's
+        // default endpoint, which `caddy stop` still reaches.
+        format!("a caddy that an earlier devhub version started (pid {pid}); stop it once with `caddy stop`")
+    } else if command.contains("caddy") {
+        format!("a caddy instance devhub does not manage (pid {pid}: `{command}`)")
+    } else {
+        format!("pid {pid} (`{command}`)")
+    }
 }
 
 fn caddyfile_is_current(desired: &str, current: Option<&str>) -> bool {
@@ -140,14 +256,27 @@ fn caddyfile_is_current(desired: &str, current: Option<&str>) -> bool {
     }
 }
 
-fn run_caddy(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> eyre::Result<bool> {
-    let mut child = match Command::new("caddy")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+/// Run one caddy CLI command and report whether it succeeded. With `log`,
+/// its output replaces that file; otherwise it is discarded.
+fn run_caddy(args: &[&str], log: Option<&Path>) -> eyre::Result<bool> {
+    let mut command = Command::new("caddy");
+    command.args(args).stdin(Stdio::null());
+    match log {
+        Some(path) => {
+            // `caddy start` hands its stdout/stderr to the server it launches.
+            // Unlink rather than truncate: a server from an earlier start may
+            // still hold the old file open.
+            let _ = std::fs::remove_file(path);
+            let file = File::create(path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            command.stdout(file.try_clone()?).stderr(file);
+        }
+        None => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(CaddyNotInstalled.into());
@@ -158,7 +287,8 @@ fn run_caddy(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> eyr
     match child.wait_timeout(CADDY_TIMEOUT)? {
         Some(status) => Ok(status.success()),
         None => {
-            child.kill()?;
+            let _ = child.kill();
+            let _ = child.wait();
             Ok(false)
         }
     }
@@ -202,6 +332,7 @@ mod tests {
                     port,
                     leader_started: None,
                     ready: true,
+                    stop_timeout_ms: None,
                 },
             );
         }
@@ -237,7 +368,8 @@ mod tests {
         let state = make_state(vec![("app", 100, Some(8080))]);
 
         let content = generate_caddyfile(&state);
-        let expected = "http://app.localhost {\n    reverse_proxy localhost:8080\n}";
+        let expected = "{\n    admin localhost:12019\n}\n\n\
+                        http://app.localhost {\n    reverse_proxy localhost:8080\n}";
         assert_eq!(content, expected);
     }
 
@@ -289,6 +421,12 @@ mod tests {
         let current = "http://app.localhost {\n    reverse_proxy localhost:8080\n}";
 
         assert!(!caddyfile_is_current(&desired, Some(current)));
+    }
+
+    #[test]
+    fn last_lines_keeps_the_tail() {
+        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(last_lines("a", 5), "a");
     }
 
     #[test]

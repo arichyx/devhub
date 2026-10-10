@@ -89,7 +89,7 @@ fn cleanup_outdated_logs_in_dir(
     Ok(removed)
 }
 
-fn read_log_tail(path: &Path) -> eyre::Result<Option<String>> {
+pub(crate) fn read_log_tail(path: &Path) -> eyre::Result<Option<String>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

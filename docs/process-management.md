@@ -350,7 +350,7 @@ The flow is:
 
 1. Load state and find the recorded group identifier for `worth`. If that identifier no longer belongs to our process (the group is gone, or the PID was reused), nothing is signaled.
 2. Send `SIGTERM` to the whole group. If the group no longer exists, the stop is already complete.
-3. Wait 100ms.
+3. Poll for up to `stop_timeout_ms` (default 5 s, recorded in state at start because `stop` does not read the config) and return as soon as the group is gone — most projects exit within milliseconds, while databases or `docker compose` get time to shut down cleanly.
 4. If the group still exists, send `SIGKILL` to the whole group.
 5. Wait until the group is confirmed gone (a short bounded poll; a group reduced to unreaped zombies counts as gone, since a zombie holds no resources, but any live member keeps the wait going).
 6. Remove `worth` from `state.json`.
@@ -399,6 +399,10 @@ Two details make that comparison trustworthy:
 - the on-disk `Caddyfile` is only kept once Caddy has accepted it; if a reload/start fails (port 80 busy, Caddy not installed), the file is removed, so the next command sees the route as missing and retries instead of treating the failed config as applied
 
 Only projects marked `ready` get a route.
+
+A matching file only records what was last applied, so each command also checks that devhub's Caddy is still running (its dedicated admin endpoint, `localhost:12019`, accepts connections) and restarts it if not.
+
+After applying, devhub verifies that nothing besides its own Caddy listens on the gateway port. This is needed because Caddy binds with `SO_REUSEPORT`: starting it next to another Caddy that already holds port 80 does not fail, and on macOS the instance that bound first keeps receiving the connections, so devhub's routes would silently never be served. Whatever else holds the port is named in the error — including a Caddy left behind by an earlier devhub version, which `caddy stop` removes.
 
 That prevents situations such as:
 

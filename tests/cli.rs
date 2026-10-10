@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +23,13 @@ struct TestEnv {
     home: TempDir,
     project_dir: TempDir,
     path: String,
+    /// Stands in for the running caddy's admin endpoint: devhub treats
+    /// caddy as up while this accepts connections.
+    caddy_admin: RefCell<Option<TcpListener>>,
+    caddy_admin_port: u16,
+    /// Gateway port for these tests, so they never look at the machine's
+    /// real port 80.
+    http_port: u16,
 }
 
 impl TestEnv {
@@ -31,13 +39,23 @@ impl TestEnv {
         let bin_dir = home.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
-        // Records every invocation; fails while `$HOME/caddy.fail` exists.
+        // Records every invocation and fails while `$HOME/caddy.fail` exists,
+        // printing what a real caddy would when port 80 is taken. Like a real
+        // caddy, `reload` fails while no server is running (`caddy.down`).
         write_executable(
             &bin_dir,
             "caddy",
             r#"#!/bin/sh
 echo "$*" >> "$HOME/caddy.calls"
-[ -f "$HOME/caddy.fail" ] && exit 1
+if [ "$1" = reload ] && [ -f "$HOME/caddy.down" ]; then
+    echo "Error: sending configuration to instance: connect: connection refused" >&2
+    exit 1
+fi
+if [ -f "$HOME/caddy.fail" ]; then
+    echo "Error: loading new config: listen tcp :80: bind: address already in use" >&2
+    exit 1
+fi
+echo "fake caddy: $1 ok"
 exit 0
 "#,
         );
@@ -47,11 +65,28 @@ exit 0
             _ => bin_dir.display().to_string(),
         };
 
+        let caddy_admin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let caddy_admin_port = caddy_admin.local_addr().unwrap().port();
+
         Self {
             home,
             project_dir,
             path,
+            caddy_admin: RefCell::new(Some(caddy_admin)),
+            caddy_admin_port,
+            http_port: reserve_port(),
         }
+    }
+
+    /// Make caddy look stopped, as after a crash: its admin endpoint stops
+    /// answering and `reload` fails until something starts it again.
+    fn crash_caddy(&self) {
+        self.caddy_admin.borrow_mut().take();
+        fs::write(self.home.path().join("caddy.down"), "").unwrap();
+    }
+
+    fn caddy_log(&self) -> String {
+        fs::read_to_string(self.devhub_dir().join("caddy.log")).unwrap_or_default()
     }
 
     fn project_path(&self) -> &Path {
@@ -117,6 +152,8 @@ exit 0
             .args(args)
             .env("HOME", self.home.path())
             .env("PATH", &self.path)
+            .env("DEVHUB_CADDY_ADMIN_PORT", self.caddy_admin_port.to_string())
+            .env("DEVHUB_HTTP_PORT", self.http_port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
@@ -317,7 +354,9 @@ time.sleep(30)
     );
     assert!(status.stdout.contains("tcp-app"));
     assert!(status.stdout.contains("running"));
-    assert!(status.stdout.contains("http://tcp-app.localhost ("));
+    assert!(status
+        .stdout
+        .contains(&format!("http://tcp-app.localhost:{} (", env.http_port)));
 
     let stop = env.run(&["stop", "tcp-app"]);
     assert!(
@@ -936,6 +975,216 @@ fn list_without_config_explains_setup() {
     assert_success(&list);
     assert!(list.stdout.contains("No projects configured."));
     assert!(list.stdout.contains("proj.json"));
+}
+
+#[test]
+fn crashed_caddy_is_restarted_by_the_next_command() {
+    let env = TestEnv::new();
+    let port = reserve_port();
+    env.write_config(json!({
+        "web": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+    assert_success(&env.run(&["start", "web"]));
+
+    // The Caddyfile on disk is still current, but nothing serves it.
+    env.crash_caddy();
+    env.clear_caddy_calls();
+    assert_success(&env.run(&["status"]));
+    assert!(
+        env.caddy_calls().iter().any(|call| call.starts_with("start")),
+        "caddy calls: {:?}",
+        env.caddy_calls()
+    );
+}
+
+#[test]
+fn caddy_output_is_logged_and_quoted_when_it_fails_to_start() {
+    let env = TestEnv::new();
+    let (first, second) = (reserve_port(), reserve_port());
+    env.write_config(json!({
+        "first": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(first, "127.0.0.1"),
+            "port": first,
+            "startup_timeout_ms": 8000
+        },
+        "second": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(second, "127.0.0.1"),
+            "port": second,
+            "startup_timeout_ms": 8000
+        }
+    }));
+
+    env.crash_caddy(); // force `caddy start` rather than a reload
+    assert_success(&env.run(&["start", "first"]));
+    assert!(env.caddy_log().contains("fake caddy: start ok"), "caddy.log: {}", env.caddy_log());
+
+    env.set_caddy_failing(true);
+    let start = env.run(&["start", "second"]);
+    assert_success(&start);
+    assert!(
+        start.stderr.contains("address already in use"),
+        "stderr: {}",
+        start.stderr
+    );
+    assert!(
+        start.stderr.contains(&format!("port {}", env.http_port)),
+        "stderr: {}",
+        start.stderr
+    );
+}
+
+#[test]
+fn stop_lets_a_project_finish_its_shutdown() {
+    let env = TestEnv::new();
+    env.write_config(json!({
+        "app": {
+            "path": env.project_path().display().to_string(),
+            // Cleanup takes 300ms after SIGTERM, longer than the old fixed
+            // 100ms before SIGKILL.
+            "cmd": "trap 'sleep 0.3; touch stopped-cleanly; exit 0' TERM; while :; do sleep 0.05; done"
+        }
+    }));
+    assert_success(&env.run(&["start", "app"]));
+
+    let started = Instant::now();
+    assert_success(&env.run(&["stop", "app"]));
+    assert!(env.project_path().join("stopped-cleanly").exists());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "stop should return once the project exits, not after the full grace period"
+    );
+}
+
+#[test]
+fn stop_kills_a_project_that_ignores_sigterm_after_its_stop_timeout() {
+    let env = TestEnv::new();
+    env.write_config(json!({
+        "stubborn": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "trap '' TERM; exec sleep 30",
+            "stop_timeout_ms": 500
+        }
+    }));
+    assert_success(&env.run(&["start", "stubborn"]));
+    let group = state_pid(&env, "stubborn") as i32;
+
+    let started = Instant::now();
+    assert_success(&env.run(&["stop", "stubborn"]));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(500), "SIGKILL came early: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "stop took {elapsed:?}");
+    wait_until("the group to disappear", || unsafe { libc::kill(-group, 0) != 0 });
+}
+
+#[test]
+fn port_owner_check_can_be_turned_off() {
+    let env = TestEnv::new();
+    // Held outside the project's process group, like Docker's port forwarder.
+    let forwarder = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = forwarder.local_addr().unwrap().port();
+    env.write_config(json!({
+        "dockerized": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "exec sleep 30",
+            "port": port,
+            "startup_timeout_ms": 5000,
+            "verify_port_owner": false
+        }
+    }));
+
+    let start = env.run(&["start", "dockerized"]);
+    assert_success(&start);
+    assert!(
+        start.stdout.contains("listener ownership not verified"),
+        "stdout: {}",
+        start.stdout
+    );
+}
+
+/// Something besides devhub's caddy listening on the gateway port, whose
+/// command line carries `marker`.
+fn occupy_gateway(env: &TestEnv, marker: &str) -> Child {
+    let squatter = Command::new("python3")
+        .args([
+            "-c",
+            "import socket, sys, time\n\
+             s = socket.socket()\n\
+             s.bind(('127.0.0.1', int(sys.argv[1])))\n\
+             s.listen()\n\
+             time.sleep(60)",
+            &env.http_port.to_string(),
+            marker,
+        ])
+        .spawn()
+        .unwrap();
+    wait_until("the gateway port to be taken", || {
+        std::net::TcpStream::connect(("127.0.0.1", env.http_port)).is_ok()
+    });
+    squatter
+}
+
+#[test]
+fn another_listener_on_the_gateway_port_is_reported() {
+    let env = TestEnv::new();
+    let port = reserve_port();
+    env.write_config(json!({
+        "web": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+    // The admin stand-in belongs to this test process, the squatter does not.
+    let mut squatter = occupy_gateway(&env, "some-other-server");
+
+    let start = env.run(&["start", "web"]);
+    squatter.kill().unwrap();
+    squatter.wait().unwrap();
+
+    assert_success(&start);
+    assert!(
+        start.stderr.contains(&format!("port {} is also held by pid {}", env.http_port, squatter.id())),
+        "stderr: {}",
+        start.stderr
+    );
+    // Not applied, so the next command retries.
+    assert!(!env.caddyfile_path().exists());
+}
+
+#[test]
+fn caddy_left_by_an_earlier_devhub_is_named_with_the_fix() {
+    let env = TestEnv::new();
+    let port = reserve_port();
+    env.write_config(json!({
+        "web": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+    // Started from devhub's own Caddyfile, but not on devhub's admin port.
+    let caddyfile = env.caddyfile_path().display().to_string();
+    let mut legacy = occupy_gateway(&env, &caddyfile);
+
+    let start = env.run(&["start", "web"]);
+    legacy.kill().unwrap();
+    legacy.wait().unwrap();
+
+    assert!(
+        start.stderr.contains("a caddy that an earlier devhub version started")
+            && start.stderr.contains("caddy stop"),
+        "stderr: {}",
+        start.stderr
+    );
 }
 
 fn state_pid(env: &TestEnv, name: &str) -> u64 {

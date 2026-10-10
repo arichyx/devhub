@@ -138,7 +138,7 @@ fn start_and_report(
 
     println!("  pid:  {pid}");
     if let Some(port) = proj.port {
-        println!("  url:  http://{name}.localhost (→ localhost:{port})");
+        println!("  url:  {} (→ localhost:{port})", caddy::project_url(name));
     }
 
     Ok(pid)
@@ -243,7 +243,7 @@ fn cmd_status(config: &config::Config, state: &state::AppState) -> Result<()> {
             let (status, url) = if ps.ready {
                 let url = ps
                     .port
-                    .map(|p| format!("http://{}.localhost (→ :{})", name, p))
+                    .map(|p| format!("{} (→ :{})", caddy::project_url(name), p))
                     .unwrap_or("-".to_string());
                 ("running", url)
             } else {

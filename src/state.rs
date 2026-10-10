@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 
+use crate::config::DEFAULT_STOP_TIMEOUT_MS;
 use crate::dirs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +23,10 @@ pub struct ProcessState {
     /// False while `devhub start` is still waiting for readiness.
     #[serde(default = "ready_by_default")]
     pub ready: bool,
+    /// The project's `stop_timeout_ms`, recorded at start because `stop`
+    /// does not read the config.
+    #[serde(default)]
+    pub stop_timeout_ms: Option<u64>,
 }
 
 /// Entries written before readiness was tracked were only ever recorded
@@ -31,14 +37,20 @@ fn ready_by_default() -> bool {
 
 impl ProcessState {
     /// A just-spawned process group that has not passed readiness yet.
-    pub fn starting(pid: u32, port: Option<u16>) -> Self {
+    pub fn starting(pid: u32, port: Option<u16>, stop_timeout_ms: u64) -> Self {
         Self {
             pid,
             started_at: Utc::now(),
             port,
             leader_started: process_start_time(pid),
             ready: false,
+            stop_timeout_ms: Some(stop_timeout_ms),
         }
+    }
+
+    /// How long `stop` lets the group shut down after SIGTERM.
+    pub fn stop_grace(&self) -> Duration {
+        Duration::from_millis(self.stop_timeout_ms.unwrap_or(DEFAULT_STOP_TIMEOUT_MS))
     }
 
     /// Whether this entry still refers to a live process group of ours.
@@ -229,6 +241,7 @@ mod tests {
             port,
             leader_started: None,
             ready: true,
+            stop_timeout_ms: None,
         }
     }
 
@@ -263,6 +276,10 @@ mod tests {
         .unwrap();
         assert!(loaded.processes["worth"].ready);
         assert_eq!(loaded.processes["worth"].leader_started, None);
+        assert_eq!(
+            loaded.processes["worth"].stop_grace(),
+            Duration::from_millis(DEFAULT_STOP_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -323,7 +340,7 @@ mod tests {
     #[test]
     fn entry_with_matching_start_time_is_alive() {
         let mut leader = spawn_group_leader();
-        let process = ProcessState::starting(leader.id(), None);
+        let process = ProcessState::starting(leader.id(), None, DEFAULT_STOP_TIMEOUT_MS);
         assert!(process.leader_started.is_some());
         assert!(process.is_alive());
 

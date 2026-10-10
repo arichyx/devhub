@@ -46,6 +46,12 @@ pub fn caddyfile_path() -> eyre::Result<PathBuf> {
     Ok(devhub_dir()?.join("Caddyfile"))
 }
 
+/// Output of devhub's caddy, kept outside `logs/` so per-project log
+/// retention never deletes it while the server still writes to it.
+pub fn caddy_log_path() -> eyre::Result<PathBuf> {
+    Ok(devhub_dir()?.join("caddy.log"))
+}
+
 pub fn logs_dir() -> eyre::Result<PathBuf> {
     let dir = devhub_dir()?.join("logs");
     if !dir.exists() {
