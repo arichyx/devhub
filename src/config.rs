@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eyre::{WrapErr, bail};
 use serde::{Deserialize, Serialize};
@@ -21,17 +21,24 @@ pub struct ProjectConfig {
     pub ready_cmd: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(flatten)]
-    pub projects: HashMap<String, ProjectConfig>,
+    pub projects: BTreeMap<String, ProjectConfig>,
 }
 
 impl Config {
     pub fn load() -> eyre::Result<Self> {
         let path = dirs::proj_path()?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config from {}", path.display()))?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            // No config yet means no projects, not a broken setup.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read config from {}", path.display()));
+            }
+        };
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse config from {}", path.display()))?;
         config.validate()?;

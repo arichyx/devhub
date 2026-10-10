@@ -51,13 +51,16 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = config::Config::load()?;
     let mut state = state::AppState::load()?;
 
-    // Clean up any stale entries
-    let dead = state.prune_dead();
-    if !dead.is_empty() {
-        state.save()?;
+    // Housekeeping never reads the project config, so a broken proj.json
+    // cannot block cleaning up after dead projects or stopping live ones.
+    if !state.prune_dead().is_empty() {
+        // Prune again under the state lock, against the current file, so
+        // entries other devhub commands wrote since our load survive.
+        state.update(|s| {
+            s.prune_dead();
+        })?;
     }
 
     if let Err(e) = logs::cleanup_outdated_logs(&state) {
@@ -65,15 +68,18 @@ fn run() -> Result<()> {
     }
 
     if let Err(e) = caddy::reconcile_caddy(&state) {
-        eprintln!("warning: caddy reload failed: {e:#}");
+        // Without caddy there is nothing to reconcile; `start` already warned.
+        if !caddy::is_not_installed(&e) {
+            eprintln!("warning: caddy reload failed: {e:#}");
+        }
     }
 
     match cli.command {
-        Commands::List => cmd_list(&config),
-        Commands::Start { name } => cmd_start(&name, &config, &mut state),
+        Commands::List => cmd_list(&config::Config::load()?),
+        Commands::Start { name } => cmd_start(&name, &config::Config::load()?, &mut state),
         Commands::Stop { name } => cmd_stop(&name, &mut state),
-        Commands::Restart { name } => cmd_restart(&name, &config, &mut state),
-        Commands::Status => cmd_status(&config, &mut state),
+        Commands::Restart { name } => cmd_restart(&name, &config::Config::load()?, &mut state),
+        Commands::Status => cmd_status(&config::Config::load()?, &state),
     }
 }
 
@@ -84,10 +90,7 @@ fn cmd_list(config: &config::Config) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<20} {:<40} {:<10} {}",
-        "PROJECT", "PATH", "PORT", "COMMAND"
-    );
+    println!("{:<20} {:<40} {:<10} COMMAND", "PROJECT", "PATH", "PORT");
     for (name, proj) in &config.projects {
         let port = proj.port.map(|p| p.to_string()).unwrap_or("-".to_string());
         println!("{:<20} {:<40} {:<10} {}", name, proj.path, port, proj.cmd);
@@ -198,7 +201,7 @@ fn cmd_restart(name: &str, config: &config::Config, state: &mut state::AppState)
         }
         Err(process::StartFailure::MaybeRunning { pid, err }) => {
             return Err(eyre::eyre!(
-                "restart failed; '{name}' may still be running as untracked pid {pid}: {err:#}"
+                "restart failed; '{name}' may still be running as pid {pid}: {err:#}"
             ));
         }
     }
@@ -226,24 +229,29 @@ fn cmd_stop(name: &str, state: &mut state::AppState) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(config: &config::Config, state: &mut state::AppState) -> Result<()> {
+fn cmd_status(config: &config::Config, state: &state::AppState) -> Result<()> {
     if config.projects.is_empty() {
         println!("No projects configured.");
+        println!("Add projects to ~/.devhub/proj.json");
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<8} {}", "PROJECT", "STATUS", "PID", "URL");
-    for (name, _proj) in &config.projects {
-        if state.is_running(name) {
-            let ps = &state.processes[name];
-            let status = "running";
-            let url = ps
-                .port
-                .map(|p| format!("http://{}.localhost (→ :{})", name, p))
-                .unwrap_or("-".to_string());
+    println!("{:<20} {:<12} {:<8} URL", "PROJECT", "STATUS", "PID");
+    for name in config.projects.keys() {
+        if let Some(ps) = state.live(name) {
+            // A starting project has no proxy route yet.
+            let (status, url) = if ps.ready {
+                let url = ps
+                    .port
+                    .map(|p| format!("http://{}.localhost (→ :{})", name, p))
+                    .unwrap_or("-".to_string());
+                ("running", url)
+            } else {
+                ("starting", "-".to_string())
+            };
             println!("{:<20} {:<12} {:<8} {}", name, status, ps.pid, url);
         } else {
-            println!("{:<20} {:<12} {:<8} {}", name, "stopped", "-", "-");
+            println!("{:<20} {:<12} {:<8} -", name, "stopped", "-");
         }
     }
 

@@ -1,14 +1,15 @@
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eyre::{WrapErr, bail, eyre};
 
 use crate::config::{ProjectConfig, expand_path};
 use crate::logs;
-use crate::state::AppState;
+use crate::state::{AppState, ProcessState};
 
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -56,12 +57,8 @@ pub fn start_project(
     config: &ProjectConfig,
     state: &mut AppState,
 ) -> Result<u32, StartFailure> {
-    if state.is_running(name) {
-        return Err(StartFailure::NothingRunning(eyre!(
-            "project '{}' is already running (pid {})",
-            name,
-            state.processes[name].pid
-        )));
+    if let Some(ps) = state.live(name) {
+        return Err(StartFailure::NothingRunning(already_started(name, ps)));
     }
 
     let expanded = expand_path(&config.path);
@@ -83,16 +80,34 @@ pub fn start_project(
         ))
     })?;
 
-    // Spawn the command in a new process group so we can kill the whole group
-    let mut child = match Command::new("sh")
+    // Installed before the spawn so an interrupt at any point after it is
+    // turned into a cleanup instead of killing devhub mid-start.
+    let _interrupts = InterruptGuard::install();
+
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&config.cmd)
         .current_dir(project_dir)
+        // A project that reads from or reconfigures an inherited terminal
+        // while in a background group is stopped by SIGTTIN/SIGTTOU.
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
-        .stderr(Stdio::from(stderr_log))
-        .process_group(0)
-        .spawn()
-    {
+        .stderr(Stdio::from(stderr_log));
+    // A new session makes the child a process group leader (pgid == pid), so
+    // the whole tree can be signaled as one group, and detaches it from the
+    // controlling terminal so job control can never stop or hang it up.
+    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             let _ = logs::remove_project_log(name);
@@ -105,41 +120,88 @@ pub fn start_project(
     };
 
     let pid = child.id();
-    wait_for_startup(name, config, project_dir, pid, &mut child)?;
 
-    state.add(name.to_string(), pid, config.port);
-    if let Err(err) = state.save() {
-        // The project is running but untrackable on disk — nothing could
-        // stop it later — so undo the start instead of leaking it.
-        state.remove(name);
-        return Err(match kill_process_group(pid) {
-            Ok(_) => {
-                let _ = logs::remove_project_log(name);
-                StartFailure::NothingRunning(eyre!(
-                    "failed to persist state for '{name}'; \
-                     stopped the just-started process (pid {pid}): {err:#}"
-                ))
-            }
-            Err(stop_err) => {
-                // The process may still be running; keep the log, the only
-                // record of what it was doing, and say so honestly.
-                let log_note = match logs::project_log_path(name) {
-                    Ok(path) => format!("log kept at {}", path.display()),
-                    Err(_) => "log kept".to_string(),
-                };
-                StartFailure::MaybeRunning {
+    // Record the group before waiting for readiness: an entry written only
+    // afterwards is lost if devhub dies mid-wait, leaving the project
+    // running with nothing able to stop it.
+    let claimed = state.update(|s| match s.live(name) {
+        Some(other) => Err(already_started(name, other)),
+        None => {
+            s.add(name.to_string(), ProcessState::starting(pid, config.port));
+            Ok(())
+        }
+    });
+    match claimed {
+        Ok(Ok(())) => {}
+        // A concurrent `devhub start` of the same project claimed it first;
+        // its log is the one now in use, so only our group is discarded.
+        Ok(Err(conflict)) => {
+            return Err(match kill_process_group(pid) {
+                Ok(_) => StartFailure::NothingRunning(conflict),
+                Err(stop_err) => StartFailure::MaybeRunning {
                     pid,
-                    err: eyre!(
-                        "could not stop the just-started process (pid {pid}): {stop_err:#} \
-                         — it may still be running; {log_note}. \
-                         Additionally, persisting state failed: {err}"
-                    ),
-                }
-            }
-        });
+                    err: eyre!("{conflict}; could not stop the duplicate process: {stop_err:#}"),
+                },
+            });
+        }
+        Err(err) => {
+            state.remove_if_pid(name, pid);
+            return Err(rollback_untracked_start(name, pid, err));
+        }
+    }
+
+    if let Err(failure) = wait_for_startup(name, config, project_dir, pid, &mut child) {
+        if let StartFailure::NothingRunning(_) = failure {
+            // Best effort: an entry left behind for a dead group is pruned by
+            // the next command anyway.
+            let _ = state.update(|s| s.remove_if_pid(name, pid));
+        }
+        // On MaybeRunning the entry stays, so `devhub stop` can still reach
+        // the group.
+        return Err(failure);
+    }
+
+    if let Err(err) = state.update(|s| s.mark_ready(name, pid)) {
+        state.remove_if_pid(name, pid);
+        return Err(rollback_untracked_start(name, pid, err));
     }
 
     Ok(pid)
+}
+
+fn already_started(name: &str, ps: &ProcessState) -> eyre::Report {
+    let phase = if ps.ready { "running" } else { "starting" };
+    eyre!("project '{name}' is already {phase} (pid {})", ps.pid)
+}
+
+/// Undo a start whose state could not be persisted: the project is running
+/// but nothing could find it later, so it must not be leaked.
+fn rollback_untracked_start(name: &str, pid: u32, err: eyre::Report) -> StartFailure {
+    match kill_process_group(pid) {
+        Ok(_) => {
+            let _ = logs::remove_project_log(name);
+            StartFailure::NothingRunning(eyre!(
+                "failed to persist state for '{name}'; \
+                 stopped the just-started process (pid {pid}): {err:#}"
+            ))
+        }
+        Err(stop_err) => {
+            // The process may still be running; keep the log, the only
+            // record of what it was doing, and say so honestly.
+            let log_note = match logs::project_log_path(name) {
+                Ok(path) => format!("log kept at {}", path.display()),
+                Err(_) => "log kept".to_string(),
+            };
+            StartFailure::MaybeRunning {
+                pid,
+                err: eyre!(
+                    "could not stop the just-started process (pid {pid}): {stop_err:#} \
+                     — it may still be running; {log_note}. \
+                     Additionally, persisting state failed: {err}"
+                ),
+            }
+        }
+    }
 }
 
 /// Stop the project if anything is still running. Err means a live process
@@ -151,10 +213,14 @@ pub fn stop_project_if_running(name: &str, state: &mut AppState) -> eyre::Result
     };
     let pid = ps.pid;
 
-    let outcome = kill_process_group(pid)?;
+    // Never signal a group whose pid now belongs to an unrelated process.
+    let outcome = if ps.is_alive() {
+        kill_process_group(pid)?
+    } else {
+        StopOutcome::AlreadyDead
+    };
 
-    state.remove(name);
-    state.save()?;
+    state.update(|s| s.remove_if_pid(name, pid))?;
     Ok(outcome)
 }
 
@@ -289,7 +355,7 @@ pub fn describe_readiness(config: &ProjectConfig) -> String {
     if let Some(cmd) = &config.ready_cmd {
         format!("exec `{cmd}`")
     } else if let Some(port) = config.port {
-        format!("tcp 127.0.0.1:{port} (listener ownership verified)")
+        format!("tcp localhost:{port} (127.0.0.1 or ::1, listener ownership verified)")
     } else {
         "none (spawn only)".to_string()
     }
@@ -318,14 +384,27 @@ fn wait_for_startup(
     group_id: u32,
     child: &mut Child,
 ) -> Result<(), StartFailure> {
+    let interrupted = || abort_startup(name, group_id, "startup interrupted".to_string());
+
     if config.ready_cmd.is_none() && config.port.is_none() {
+        if interrupt_received() {
+            return Err(interrupted());
+        }
         return Ok(());
     }
 
     let timeout = Duration::from_millis(config.startup_timeout_ms);
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 60 * 60));
 
     loop {
+        if interrupt_received() {
+            return Err(interrupted());
+        }
+
+        // Reaping the leader first matters: an unreaped zombie leader keeps
+        // the group looking alive.
         let status = child.try_wait().map_err(|err| {
             abort_startup(
                 name,
@@ -333,24 +412,12 @@ fn wait_for_startup(
                 format!("failed to poll project status: {err}"),
             )
         })?;
-        if let Some(status) = status {
-            if !crate::state::is_process_group_alive(group_id) {
-                return Err(StartFailure::NothingRunning(startup_failure(
-                    name,
-                    format!(
-                        "project exited before becoming ready{}",
-                        format_exit_status(Some(&status))
-                    ),
-                )));
-            }
-        }
-
         if !crate::state::is_process_group_alive(group_id) {
             return Err(StartFailure::NothingRunning(startup_failure(
                 name,
                 format!(
                     "project exited before becoming ready{}",
-                    format_exit_status(None)
+                    format_exit_status(status.as_ref())
                 ),
             )));
         }
@@ -369,6 +436,12 @@ fn wait_for_startup(
         let probe = readiness_probe_passed(config, project_dir, probe_timeout, group_id).map_err(
             |err| abort_startup(name, group_id, format!("readiness probe failed: {err:#}")),
         )?;
+        // Ctrl-C also reaches the probe's own helpers (ready_cmd, lsof), and a
+        // killed lsof reads as "listener not attributable"; never let an
+        // interrupted round count as ready.
+        if interrupt_received() {
+            return Err(interrupted());
+        }
         match probe {
             ProbeOutcome::Ready => return Ok(()),
             ProbeOutcome::NotYet => {}
@@ -496,7 +569,7 @@ pub(crate) fn listener_details(pid: u32) -> Option<(u32, String)> {
         .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text.trim().split_whitespace();
+    let mut parts = text.split_whitespace();
     let pgid: u32 = parts.next()?.parse().ok()?;
     let command = parts.collect::<Vec<_>>().join(" ");
     Some((pgid, command))
@@ -507,6 +580,7 @@ fn exec_readiness_probe(cmd: &str, project_dir: &Path, timeout: Duration) -> eyr
         .arg("-c")
         .arg(cmd)
         .current_dir(project_dir)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -522,9 +596,14 @@ fn exec_readiness_probe(cmd: &str, project_dir: &Path, timeout: Duration) -> eyr
     }
 }
 
+/// Whether anything accepts connections on `port` on either loopback
+/// address. Dev servers bound to `localhost` often listen on one family
+/// only (Node 17+ resolves localhost to ::1 on macOS), and the proxy's
+/// `localhost` upstream reaches either.
 fn tcp_readiness_probe(port: u16) -> bool {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT).is_ok()
+    [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]
+        .into_iter()
+        .any(|ip| TcpStream::connect_timeout(&SocketAddr::new(ip, port), TCP_CONNECT_TIMEOUT).is_ok())
 }
 
 fn startup_failure(name: &str, message: String) -> eyre::Report {
@@ -542,6 +621,50 @@ fn format_exit_status(status: Option<&ExitStatus>) -> String {
     match status.and_then(ExitStatus::code) {
         Some(code) => format!(" (code {code})"),
         None => String::new(),
+    }
+}
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+const INTERRUPT_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+extern "C" fn note_interrupt(_signal: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+fn interrupt_received() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// While alive, turns SIGINT/SIGTERM/SIGHUP into a flag that the startup
+/// wait polls, so an interrupted start can kill the group it spawned rather
+/// than die and leave it running. Signals that were ignored on entry (e.g.
+/// under `nohup`) stay ignored; previous handlers return on drop.
+struct InterruptGuard {
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+impl InterruptGuard {
+    fn install() -> Self {
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let handler = note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let mut previous = Vec::with_capacity(INTERRUPT_SIGNALS.len());
+        for signal in INTERRUPT_SIGNALS {
+            let old = unsafe { libc::signal(signal, handler) };
+            if old == libc::SIG_IGN {
+                unsafe { libc::signal(signal, libc::SIG_IGN) };
+            } else {
+                previous.push((signal, old));
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        for &(signal, handler) in &self.previous {
+            unsafe { libc::signal(signal, handler) };
+        }
     }
 }
 
@@ -656,7 +779,10 @@ mod tests {
     fn stop_if_running_cleans_stale_entry() {
         with_temp_devhub_dir(|| {
             let mut state = AppState::default();
-            state.add("crashed".to_string(), 99999999, Some(3000));
+            state.add(
+                "crashed".to_string(),
+                ProcessState::starting(99999999, Some(3000)),
+            );
 
             assert_eq!(
                 stop_project_if_running("crashed", &mut state).unwrap(),
@@ -726,19 +852,17 @@ mod tests {
         with_temp_devhub_dir(|| {
             let devhub_dir = crate::dirs::devhub_dir().unwrap();
             let logs_dir = crate::dirs::logs_dir().unwrap();
+            // The lock can still be taken; only writing the state fails.
+            std::fs::File::create(crate::dirs::state_lock_path().unwrap()).unwrap();
             std::fs::set_permissions(&devhub_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-            let pidfile = std::env::temp_dir()
-                .join(format!("devhub-test-rollback-{}.pid", std::process::id()));
             let mut state = AppState::default();
             let config = ProjectConfig {
                 path: "/tmp".to_string(),
-                cmd: format!("echo $$ > {}; sleep 30", pidfile.display()),
+                cmd: "sleep 30".to_string(),
                 port: None,
                 startup_timeout_ms: 60_000,
-                // Block startup until the process has written its pid, so
-                // the rollback cannot race ahead of the echo.
-                ready_cmd: Some(format!("test -f {}", pidfile.display())),
+                ready_cmd: None,
             };
 
             let result = start_project("leaky", &config, &mut state);
@@ -755,17 +879,95 @@ mod tests {
             );
             assert!(state.processes.is_empty());
 
-            let pid: u32 = std::fs::read_to_string(&pidfile)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            let _ = std::fs::remove_file(&pidfile);
+            let pid: u32 = error
+                .split("(pid ")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .and_then(|pid| pid.parse().ok())
+                .unwrap_or_else(|| panic!("no pid in error: {error}"));
             assert!(
-                group_has_only_zombies(pid),
+                !crate::state::is_process_group_alive(pid) || group_has_only_zombies(pid),
                 "the just-started process must be rolled back"
             );
             assert!(!logs_dir.join("leaky.log").exists());
+        });
+    }
+
+    #[test]
+    fn project_runs_in_its_own_session() {
+        with_temp_devhub_dir(|| {
+            let mut state = AppState::default();
+            let config = ProjectConfig {
+                path: "/tmp".to_string(),
+                cmd: "sleep 30".to_string(),
+                port: None,
+                startup_timeout_ms: 60_000,
+                ready_cmd: None,
+            };
+
+            let pid = start_project("session", &config, &mut state).unwrap();
+            // Session leader, hence also group leader, and so without a
+            // controlling terminal.
+            assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
+            assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32);
+
+            stop_project("session", &mut state).unwrap();
+            let _ = crate::logs::remove_project_log("session");
+        });
+    }
+
+    #[test]
+    fn started_project_is_recorded_as_ready() {
+        with_temp_devhub_dir(|| {
+            let mut state = AppState::default();
+            let config = ProjectConfig {
+                path: "/tmp".to_string(),
+                cmd: "sleep 30".to_string(),
+                port: None,
+                startup_timeout_ms: 60_000,
+                ready_cmd: Some("true".to_string()),
+            };
+
+            let pid = start_project("recorded", &config, &mut state).unwrap();
+            let on_disk = AppState::load().unwrap();
+            let entry = &on_disk.processes["recorded"];
+            assert_eq!(entry.pid, pid);
+            assert!(entry.ready);
+            assert!(entry.leader_started.is_some());
+
+            stop_project("recorded", &mut state).unwrap();
+            let _ = crate::logs::remove_project_log("recorded");
+        });
+    }
+
+    #[test]
+    fn stop_leaves_a_reused_pid_alone() {
+        with_temp_devhub_dir(|| {
+            let mut bystander = Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut state = AppState::default();
+            state.add(
+                "gone".to_string(),
+                ProcessState {
+                    leader_started: Some("Mon Jan  1 00:00:00 2001".to_string()),
+                    ..ProcessState::starting(bystander.id(), None)
+                },
+            );
+
+            assert_eq!(
+                stop_project_if_running("gone", &mut state).unwrap(),
+                StopOutcome::AlreadyDead
+            );
+            assert!(
+                bystander.try_wait().unwrap().is_none(),
+                "an unrelated process that reused the pid must not be signaled"
+            );
+
+            bystander.kill().unwrap();
+            bystander.wait().unwrap();
         });
     }
 
@@ -795,6 +997,16 @@ mod tests {
     #[test]
     fn tcp_probe_detects_open_listener() {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_readiness_probe(port));
+    }
+
+    #[test]
+    fn tcp_probe_detects_ipv6_only_listener() {
+        // Skip on hosts without IPv6 loopback.
+        let Ok(listener) = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            return;
+        };
         let port = listener.local_addr().unwrap().port();
         assert!(tcp_readiness_probe(port));
     }

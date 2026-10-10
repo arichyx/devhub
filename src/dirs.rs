@@ -38,6 +38,10 @@ pub fn state_path() -> eyre::Result<PathBuf> {
     Ok(devhub_dir()?.join("state.json"))
 }
 
+pub fn state_lock_path() -> eyre::Result<PathBuf> {
+    Ok(devhub_dir()?.join("state.lock"))
+}
+
 pub fn caddyfile_path() -> eyre::Result<PathBuf> {
     Ok(devhub_dir()?.join("Caddyfile"))
 }

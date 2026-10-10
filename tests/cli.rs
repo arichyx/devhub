@@ -4,7 +4,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
@@ -31,10 +31,13 @@ impl TestEnv {
         let bin_dir = home.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
+        // Records every invocation; fails while `$HOME/caddy.fail` exists.
         write_executable(
             &bin_dir,
             "caddy",
             r#"#!/bin/sh
+echo "$*" >> "$HOME/caddy.calls"
+[ -f "$HOME/caddy.fail" ] && exit 1
 exit 0
 "#,
         );
@@ -84,12 +87,31 @@ exit 0
         .unwrap();
     }
 
+    fn caddy_calls(&self) -> Vec<String> {
+        fs::read_to_string(self.home.path().join("caddy.calls"))
+            .map(|calls| calls.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    fn clear_caddy_calls(&self) {
+        let _ = fs::remove_file(self.home.path().join("caddy.calls"));
+    }
+
+    fn set_caddy_failing(&self, failing: bool) {
+        let flag = self.home.path().join("caddy.fail");
+        if failing {
+            fs::write(flag, "").unwrap();
+        } else {
+            let _ = fs::remove_file(flag);
+        }
+    }
+
     fn read_state(&self) -> Option<Value> {
         let content = fs::read_to_string(self.state_path()).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    fn run(&self, args: &[&str]) -> CommandOutput {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_devhub"));
         command
             .args(args)
@@ -97,8 +119,16 @@ exit 0
             .env("PATH", &self.path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
 
-        run_command(command)
+    fn run(&self, args: &[&str]) -> CommandOutput {
+        run_command(self.command(args))
+    }
+
+    /// Run devhub in the background; collect it with `wait_child`.
+    fn spawn(&self, args: &[&str]) -> Child {
+        self.command(args).spawn().unwrap()
     }
 }
 
@@ -241,8 +271,7 @@ fn start_uses_tcp_probe_when_only_port_is_configured() {
 
     fs::write(
         env.project_path().join("tcp_service.py"),
-        format!(
-            r#"import socket
+        r#"import socket
 import sys
 import time
 
@@ -255,8 +284,7 @@ sock.bind(("127.0.0.1", port))
 sock.listen()
 print("listening", flush=True)
 time.sleep(30)
-"#
-        ),
+"#,
     )
     .unwrap();
 
@@ -276,7 +304,7 @@ time.sleep(30)
         start.stdout,
         start.stderr
     );
-    assert!(start.stdout.contains(&format!("tcp 127.0.0.1:{port}")));
+    assert!(start.stdout.contains(&format!("tcp localhost:{port}")));
     assert!(start.stdout.contains("Started."));
     assert!(env.caddyfile_path().exists());
 
@@ -716,6 +744,200 @@ exit 7
     );
 }
 
+#[test]
+fn concurrent_starts_keep_both_projects_tracked() {
+    let env = TestEnv::new();
+    env.write_config(json!({
+        "first": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "exec sleep 30",
+            "ready_cmd": "sleep 0.5"
+        },
+        "second": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "exec sleep 30",
+            "ready_cmd": "sleep 0.8"
+        }
+    }));
+
+    // Both commands load the state before either writes it back.
+    let first = env.spawn(&["start", "first"]);
+    let second = env.spawn(&["start", "second"]);
+    assert_success(&wait_child(first));
+    assert_success(&wait_child(second));
+
+    let state = env.read_state().unwrap();
+    assert!(state.get("first").is_some(), "state: {state}");
+    assert!(state.get("second").is_some(), "state: {state}");
+}
+
+#[test]
+fn interrupted_start_stops_the_project_it_spawned() {
+    let env = TestEnv::new();
+    let pidfile = env.project_path().join("pid");
+    env.write_config(json!({
+        "slow": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "echo $$ > pid; exec sleep 30",
+            "startup_timeout_ms": 20000,
+            "ready_cmd": "false"
+        }
+    }));
+
+    let start = env.spawn(&["start", "slow"]);
+    wait_until("the project to be recorded", || {
+        pidfile.exists() && env.read_state().is_some_and(|state| state.get("slow").is_some())
+    });
+
+    // Tracked while still waiting for readiness, so nothing is lost if
+    // devhub dies here.
+    let status = env.run(&["status"]);
+    assert!(status.stdout.contains("starting"), "stdout: {}", status.stdout);
+
+    unsafe {
+        libc::kill(start.id() as i32, libc::SIGINT);
+    }
+    let start = wait_child(start);
+    assert!(!start.status.success());
+    assert!(
+        start.stderr.contains("startup interrupted"),
+        "stderr: {}",
+        start.stderr
+    );
+    assert_eq!(env.read_state().unwrap(), json!({}));
+
+    let group: i32 = fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    wait_until("the project group to disappear", || unsafe {
+        libc::kill(-group, 0) != 0
+    });
+}
+
+#[test]
+fn project_does_not_inherit_devhub_stdin() {
+    let env = TestEnv::new();
+    let log = env.log_path("reader");
+    env.write_config(json!({
+        "reader": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "read line; echo \"read-exit=$?\"; exec sleep 30",
+            "startup_timeout_ms": 5000,
+            "ready_cmd": format!("grep -q read-exit= {}", log.display())
+        }
+    }));
+
+    // devhub's stdin stays open without data, like an idle terminal; a
+    // project reading an inherited stdin would block forever.
+    let mut command = env.command(&["start", "reader"]);
+    command.stdin(Stdio::piped());
+    assert_success(&run_command(command));
+}
+
+#[test]
+fn start_accepts_ipv6_only_listener() {
+    if TcpListener::bind(("::1", 0)).is_err() {
+        return; // no IPv6 loopback on this host
+    }
+    let env = TestEnv::new();
+    let port = reserve_port();
+    env.write_config(json!({
+        "v6": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(port, "::1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+
+    let start = env.run(&["start", "v6"]);
+    assert_success(&start);
+    assert!(start.stdout.contains("Started."));
+}
+
+#[test]
+fn unchanged_routes_do_not_reload_caddy() {
+    let env = TestEnv::new();
+    let (beta_port, alpha_port) = (reserve_port(), reserve_port());
+    env.write_config(json!({
+        "beta": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(beta_port, "127.0.0.1"),
+            "port": beta_port,
+            "startup_timeout_ms": 8000
+        },
+        "alpha": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(alpha_port, "127.0.0.1"),
+            "port": alpha_port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+    assert_success(&env.run(&["start", "beta"]));
+    assert_success(&env.run(&["start", "alpha"]));
+
+    env.clear_caddy_calls();
+    for _ in 0..5 {
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        let alpha = status.stdout.find("alpha").unwrap();
+        let beta = status.stdout.find("beta").unwrap();
+        assert!(alpha < beta, "projects should be listed by name:\n{}", status.stdout);
+    }
+    assert_eq!(env.caddy_calls(), Vec::<String>::new());
+}
+
+#[test]
+fn failed_caddy_apply_is_retried_by_the_next_command() {
+    let env = TestEnv::new();
+    let port = reserve_port();
+    env.write_config(json!({
+        "web": {
+            "path": env.project_path().display().to_string(),
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+
+    env.set_caddy_failing(true);
+    let start = env.run(&["start", "web"]);
+    assert_success(&start);
+    assert!(start.stderr.contains("caddy reload failed"), "stderr: {}", start.stderr);
+
+    env.set_caddy_failing(false);
+    env.clear_caddy_calls();
+    assert_success(&env.run(&["status"]));
+    assert!(
+        !env.caddy_calls().is_empty(),
+        "the route that failed to apply must be retried"
+    );
+    assert!(env.caddyfile_path().exists());
+}
+
+#[test]
+fn stop_works_while_config_is_broken() {
+    let env = TestEnv::new();
+    env.write_config(json!({
+        "app": {
+            "path": env.project_path().display().to_string(),
+            "cmd": "exec sleep 30"
+        }
+    }));
+    assert_success(&env.run(&["start", "app"]));
+
+    fs::write(env.proj_path(), "{ \"app\": { mid-edit").unwrap();
+    assert_success(&env.run(&["stop", "app"]));
+    assert_eq!(env.read_state().unwrap(), json!({}));
+}
+
+#[test]
+fn list_without_config_explains_setup() {
+    let env = TestEnv::new();
+    let list = env.run(&["list"]);
+    assert_success(&list);
+    assert!(list.stdout.contains("No projects configured."));
+    assert!(list.stdout.contains("proj.json"));
+}
+
 fn state_pid(env: &TestEnv, name: &str) -> u64 {
     let state = env.read_state().unwrap_or_else(|| json!({}));
     state
@@ -741,7 +963,10 @@ fn reserve_port() -> u16 {
 }
 
 fn run_command(mut command: Command) -> CommandOutput {
-    let mut child = command.spawn().unwrap();
+    wait_child(command.spawn().unwrap())
+}
+
+fn wait_child(mut child: Child) -> CommandOutput {
     let deadline = Instant::now() + COMMAND_TIMEOUT;
 
     loop {
@@ -766,6 +991,27 @@ fn run_command(mut command: Command) -> CommandOutput {
 
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn http_server_cmd(port: u16, bind: &str) -> String {
+    format!("exec python3 -m http.server {port} --bind {bind}")
+}
+
+fn assert_success(output: &CommandOutput) {
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
 }
 
 fn set_file_mtime(path: &Path, time: SystemTime) {
