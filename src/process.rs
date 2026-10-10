@@ -3,6 +3,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use eyre::{WrapErr, bail, eyre};
@@ -109,6 +110,7 @@ pub fn start_project(
             Ok(())
         });
     }
+    inherit_only_stdio(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -174,6 +176,35 @@ pub fn start_project(
     }
 
     Ok(pid)
+}
+
+/// devhub never holds more than a few hundred descriptors, and the kernel
+/// always hands out the lowest free one, so sweeping this far covers all of
+/// them without a long loop under a huge `ulimit -n`.
+const SWEPT_FD_LIMIT: libc::c_int = 4096;
+
+/// Make the child of `command` inherit nothing but stdin, stdout and stderr,
+/// for children that outlive devhub (projects, caddy's server).
+///
+/// Batches spawn from several threads, and on macOS the standard library
+/// marks a new pipe or socket close-on-exec in a second call after creating
+/// it. A fork on another thread in between hands the descriptor to that
+/// child. A leaked pipe write end in a long-lived child leaves whoever reads
+/// the pipe waiting forever for an EOF, such as a thread reading `lsof`
+/// output or the spawn of another project waiting for its exec to report.
+pub(crate) fn inherit_only_stdio(command: &mut Command) {
+    // Computed before the fork: only async-signal-safe calls may follow it.
+    let limit = unsafe { libc::getdtablesize() }.min(SWEPT_FD_LIMIT);
+    // SAFETY: fcntl is async-signal-safe, as pre_exec requires. Descriptors
+    // that are not open fail with EBADF, which is ignored.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in 3..limit {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
 }
 
 fn already_started(name: &str, ps: &ProcessState) -> eyre::Report {
@@ -676,39 +707,71 @@ extern "C" fn note_interrupt(_signal: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-fn interrupt_received() -> bool {
+pub fn interrupt_received() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// The guards alive across all threads, and the handlers the outermost one
+/// replaced.
+struct InterruptScope {
+    depth: usize,
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+static INTERRUPT_SCOPE: Mutex<InterruptScope> = Mutex::new(InterruptScope {
+    depth: 0,
+    previous: Vec::new(),
+});
+
+fn interrupt_scope() -> MutexGuard<'static, InterruptScope> {
+    INTERRUPT_SCOPE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// While alive, turns SIGINT/SIGTERM/SIGHUP into a flag that the startup
 /// wait polls, so an interrupted start can kill the group it spawned rather
 /// than die and leave it running. Signals that were ignored on entry (e.g.
-/// under `nohup`) stay ignored; previous handlers return on drop.
-struct InterruptGuard {
-    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+/// under `nohup`) stay ignored; previous handlers return when the last
+/// guard drops.
+///
+/// Guards nest, across threads too: only the outermost clears the flag and
+/// swaps handlers. Parallel starts each hold one inside a batch's guard, and
+/// a start that cleared the flag on entry would hide an interrupt from the
+/// others still waiting; one that restored the handlers on exit would let
+/// the next Ctrl-C kill devhub mid-start.
+pub struct InterruptGuard {
+    _private: (),
 }
 
 impl InterruptGuard {
-    fn install() -> Self {
-        INTERRUPTED.store(false, Ordering::SeqCst);
-        let handler = note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        let mut previous = Vec::with_capacity(INTERRUPT_SIGNALS.len());
-        for signal in INTERRUPT_SIGNALS {
-            let old = unsafe { libc::signal(signal, handler) };
-            if old == libc::SIG_IGN {
-                unsafe { libc::signal(signal, libc::SIG_IGN) };
-            } else {
-                previous.push((signal, old));
+    pub fn install() -> Self {
+        let mut scope = interrupt_scope();
+        if scope.depth == 0 {
+            INTERRUPTED.store(false, Ordering::SeqCst);
+            let handler = note_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            for signal in INTERRUPT_SIGNALS {
+                let old = unsafe { libc::signal(signal, handler) };
+                if old == libc::SIG_IGN {
+                    unsafe { libc::signal(signal, libc::SIG_IGN) };
+                } else {
+                    scope.previous.push((signal, old));
+                }
             }
         }
-        Self { previous }
+        scope.depth += 1;
+        Self { _private: () }
     }
 }
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        for &(signal, handler) in &self.previous {
-            unsafe { libc::signal(signal, handler) };
+        let mut scope = interrupt_scope();
+        scope.depth -= 1;
+        if scope.depth == 0 {
+            for (signal, handler) in std::mem::take(&mut scope.previous) {
+                unsafe { libc::signal(signal, handler) };
+            }
         }
     }
 }
@@ -1148,5 +1211,27 @@ mod tests {
             );
             let _ = crate::logs::remove_project_log("hang-probe");
         });
+    }
+
+    #[test]
+    fn guards_released_out_of_order_keep_handlers_until_the_last() {
+        let first = InterruptGuard::install();
+        let second = InterruptGuard::install();
+        // note_interrupt, or SIG_IGN when the tests run with SIGINT ignored.
+        let installed = current_handler(libc::SIGINT);
+
+        // Parallel starts finish in any order; the first to finish must not
+        // hand Ctrl-C back to its default action while another still waits.
+        drop(first);
+        assert_eq!(current_handler(libc::SIGINT), installed);
+        drop(second);
+    }
+
+    fn current_handler(signal: libc::c_int) -> libc::sighandler_t {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut action);
+            action.sa_sigaction
+        }
     }
 }

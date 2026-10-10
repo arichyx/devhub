@@ -852,6 +852,269 @@ fn interrupted_start_stops_the_project_it_spawned() {
 }
 
 #[test]
+fn start_all_starts_projects_in_parallel_and_skips_running_ones() {
+    let env = TestEnv::new();
+    let dir = env.project_path().display().to_string();
+    let (alpha_port, beta_port) = (reserve_port(), reserve_port());
+    // Each becomes ready only once the other has been launched, so starting
+    // them one after the other would time out the first.
+    env.write_config(json!({
+        "alpha": {
+            "path": dir,
+            "cmd": format!("touch alpha.up; {}", http_server_cmd(alpha_port, "127.0.0.1")),
+            "port": alpha_port,
+            "startup_timeout_ms": 8000,
+            "ready_cmd": "test -f beta.up"
+        },
+        "beta": {
+            "path": dir,
+            "cmd": format!("touch beta.up; {}", http_server_cmd(beta_port, "127.0.0.1")),
+            "port": beta_port,
+            "startup_timeout_ms": 8000,
+            "ready_cmd": "test -f alpha.up"
+        },
+        "gamma": {
+            "path": dir,
+            "cmd": "exec sleep 30"
+        }
+    }));
+    assert_success(&env.run(&["start", "gamma"]));
+    let gamma_pid = state_pid(&env, "gamma");
+
+    let start = env.run(&["start", "--all"]);
+    assert_success(&start);
+    assert!(
+        start.stdout.contains("Starting 'alpha', 'beta'..."),
+        "stdout: {}",
+        start.stdout
+    );
+    assert!(
+        start
+            .stdout
+            .contains(&format!("skipped, already running (pid {gamma_pid})")),
+        "stdout: {}",
+        start.stdout
+    );
+    assert!(start.stdout.contains("Started 2 projects, skipped 1."));
+    assert_eq!(state_pid(&env, "gamma"), gamma_pid);
+
+    // Two projects turning ready together each update caddy; neither
+    // update may drop the other's route.
+    let caddyfile = fs::read_to_string(env.caddyfile_path()).unwrap();
+    assert!(caddyfile.contains(&format!("reverse_proxy localhost:{alpha_port}")));
+    assert!(caddyfile.contains(&format!("reverse_proxy localhost:{beta_port}")));
+}
+
+#[test]
+fn failing_projects_in_a_batch_leave_the_others_running() {
+    let env = TestEnv::new();
+    let dir = env.project_path().display().to_string();
+    let port = reserve_port();
+    env.write_config(json!({
+        "broken": {
+            "path": dir,
+            "cmd": "echo broken-output; exit 3",
+            "ready_cmd": "false"
+        },
+        "web": {
+            "path": dir,
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+
+    let start = env.run(&["start", "broken", "web", "typo"]);
+    assert!(!start.status.success(), "stdout: {}", start.stdout);
+    assert!(
+        start
+            .stdout
+            .contains("FAILED, project exited before becoming ready (code 3)"),
+        "stdout: {}",
+        start.stdout
+    );
+    assert!(start.stdout.contains("FAILED, project 'typo' not found in config"));
+    assert!(start.stdout.contains("started (pid"));
+    assert!(
+        start.stderr.contains("broken-output"),
+        "stderr: {}",
+        start.stderr
+    );
+    assert!(
+        start
+            .stderr
+            .contains("2 of 3 projects failed to start: broken, typo"),
+        "stderr: {}",
+        start.stderr
+    );
+
+    let state = env.read_state().unwrap();
+    assert!(state.get("web").is_some(), "state: {state}");
+    assert!(state.get("broken").is_none(), "state: {state}");
+    assert!(!env.log_path("broken").exists());
+    let caddyfile = fs::read_to_string(env.caddyfile_path()).unwrap();
+    assert!(caddyfile.contains(&format!("reverse_proxy localhost:{port}")));
+}
+
+#[test]
+fn stop_all_stops_everything_running_even_with_a_broken_config() {
+    let env = TestEnv::new();
+    let dir = env.project_path().display().to_string();
+    let port = reserve_port();
+    env.write_config(json!({
+        "one": {
+            "path": dir,
+            "cmd": "exec sleep 30"
+        },
+        "two": {
+            "path": dir,
+            "cmd": http_server_cmd(port, "127.0.0.1"),
+            "port": port,
+            "startup_timeout_ms": 8000
+        }
+    }));
+    assert_success(&env.run(&["start", "--all"]));
+    let pids = [state_pid(&env, "one"), state_pid(&env, "two")];
+    assert!(env.caddyfile_path().exists());
+
+    // Mid-edit config: stopping must not depend on it.
+    fs::write(env.proj_path(), "{ not json").unwrap();
+    env.clear_caddy_calls();
+
+    let stop = env.run(&["stop", "--all"]);
+    assert_success(&stop);
+    assert!(stop.stdout.contains("Stopping 'one', 'two'..."));
+    assert!(stop.stdout.contains("Stopped 2 projects."));
+    assert_eq!(env.read_state().unwrap(), json!({}));
+    assert!(!env.log_path("one").exists());
+    assert!(!env.log_path("two").exists());
+    assert!(!env.caddyfile_path().exists());
+    assert!(
+        env.caddy_calls().iter().any(|call| call.starts_with("stop")),
+        "caddy calls: {:?}",
+        env.caddy_calls()
+    );
+    for pid in pids {
+        unsafe {
+            assert_eq!(libc::kill(-(pid as i32), 0), -1, "group {pid} should be gone");
+        }
+    }
+
+    let again = env.run(&["stop", "--all"]);
+    assert_success(&again);
+    assert!(again.stdout.contains("No projects running."));
+}
+
+#[test]
+fn stopping_several_projects_skips_those_not_running() {
+    let env = TestEnv::new();
+    let dir = env.project_path().display().to_string();
+    env.write_config(json!({
+        "one": { "path": dir, "cmd": "exec sleep 30" },
+        "two": { "path": dir, "cmd": "exec sleep 30" }
+    }));
+    assert_success(&env.run(&["start", "one"]));
+
+    let stop = env.run(&["stop", "one", "two"]);
+    assert_success(&stop);
+    assert!(stop.stdout.contains("Stopping 'one'..."));
+    assert!(
+        stop.stdout.contains("two:  skipped, not running"),
+        "stdout: {}",
+        stop.stdout
+    );
+    assert!(stop.stdout.contains("Stopped 1 project, skipped 1."));
+    assert_eq!(env.read_state().unwrap(), json!({}));
+}
+
+#[test]
+fn interrupted_batch_start_stops_only_the_projects_still_starting() {
+    let env = TestEnv::new();
+    let dir = env.project_path().display().to_string();
+    let slow = |pidfile: &str| {
+        json!({
+            "path": dir,
+            "cmd": format!("echo $$ > {pidfile}; exec sleep 30"),
+            "startup_timeout_ms": 20000,
+            "ready_cmd": "false"
+        })
+    };
+    env.write_config(json!({
+        "quick": { "path": dir, "cmd": "exec sleep 30" },
+        "slow-a": slow("a.pid"),
+        "slow-b": slow("b.pid")
+    }));
+
+    let start = env.spawn(&["start", "--all"]);
+    let pidfiles = [
+        env.project_path().join("a.pid"),
+        env.project_path().join("b.pid"),
+    ];
+    wait_until("quick to be ready and both slow projects recorded", || {
+        let Some(state) = env.read_state() else {
+            return false;
+        };
+        pidfiles.iter().all(|pidfile| pidfile.exists())
+            && state.get("slow-a").is_some()
+            && state.get("slow-b").is_some()
+            && state
+                .get("quick")
+                .and_then(|ps| ps.get("ready"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    });
+
+    // Quick's start has already finished; that must not have handed
+    // Ctrl-C back to the default action while the others still wait.
+    unsafe {
+        libc::kill(start.id() as i32, libc::SIGINT);
+    }
+    let start = wait_child(start);
+    assert!(!start.status.success(), "stdout: {}", start.stdout);
+    for name in ["slow-a", "slow-b"] {
+        assert!(
+            start
+                .stderr
+                .contains(&format!("'{name}' failed to start: startup interrupted")),
+            "stderr: {}",
+            start.stderr
+        );
+    }
+    assert!(
+        start
+            .stderr
+            .contains("2 of 3 projects failed to start: slow-a, slow-b"),
+        "stderr: {}",
+        start.stderr
+    );
+
+    let state = env.read_state().unwrap();
+    assert!(state.get("quick").is_some(), "state: {state}");
+    assert!(state.get("slow-a").is_none(), "state: {state}");
+    assert!(state.get("slow-b").is_none(), "state: {state}");
+    for pidfile in &pidfiles {
+        let group: i32 = fs::read_to_string(pidfile).unwrap().trim().parse().unwrap();
+        wait_until("the slow project group to disappear", || unsafe {
+            libc::kill(-group, 0) != 0
+        });
+    }
+}
+
+#[test]
+fn start_and_stop_need_names_or_all() {
+    let env = TestEnv::new();
+    for args in [&["start"][..], &["stop"], &["start", "x", "--all"]] {
+        let output = env.run(args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            output.stderr.contains("--all"),
+            "stderr: {}",
+            output.stderr
+        );
+    }
+}
+
+#[test]
 fn project_does_not_inherit_devhub_stdin() {
     let env = TestEnv::new();
     let log = env.log_path("reader");
@@ -869,6 +1132,34 @@ fn project_does_not_inherit_devhub_stdin() {
     let mut command = env.command(&["start", "reader"]);
     command.stdin(Stdio::piped());
     assert_success(&run_command(command));
+}
+
+#[test]
+fn project_inherits_no_descriptors_beyond_stdio() {
+    let env = TestEnv::new();
+    // Not close-on-exec, so devhub inherits it, the way a descriptor another
+    // thread had just created can slip into a fork.
+    let dir = std::ffi::CString::new(env.project_path().to_str().unwrap()).unwrap();
+    let stray = unsafe { libc::open(dir.as_ptr(), libc::O_RDONLY) };
+    assert!(stray > 2, "failed to open a stray descriptor");
+
+    env.write_config(json!({
+        "fds": {
+            "path": env.project_path().display().to_string(),
+            "cmd": format!(
+                "if {{ true >&{stray}; }} 2>/dev/null; then echo leaked; else echo clean; fi > fdcheck; \
+                 exec sleep 30"
+            ),
+            "startup_timeout_ms": 5000,
+            "ready_cmd": "test -s fdcheck"
+        }
+    }));
+    let start = env.run(&["start", "fds"]);
+    unsafe { libc::close(stray) };
+    assert_success(&start);
+
+    let check = fs::read_to_string(env.project_path().join("fdcheck")).unwrap();
+    assert_eq!(check.trim(), "clean", "fd {stray} leaked into the project");
 }
 
 #[test]

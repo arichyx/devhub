@@ -3,7 +3,7 @@
 This document explains how `devhub` works as a whole:
 
 - where project definitions live
-- how `start`, `status`, `stop`, and `restart` work
+- how `start`, `status`, `stop`, and `restart` work, including starting or stopping several projects at once
 - how runtime state is stored
 - how local proxy routes are derived from that state
 - why Unix process groups are the core abstraction
@@ -280,6 +280,7 @@ The main pieces of the implementation are:
 - `src/config.rs`: loads `proj.json`
 - `src/state.rs`: loads, saves, prunes, and probes runtime state
 - `src/process.rs`: starts and stops managed process groups
+- `src/batch.rs`: runs `start`/`stop` for several projects in parallel and summarizes the outcome
 - `src/caddy.rs`: generates and reconciles the Caddy config
 - `src/dirs.rs`: resolves paths under `~/.devhub/`
 
@@ -301,7 +302,7 @@ The flow is:
 6. Create or truncate `~/.devhub/logs/worth.log`.
 7. Expand `~` in the configured path.
 8. Start treating `SIGINT`/`SIGTERM`/`SIGHUP` as "abort this start" instead of letting them kill `devhub`.
-9. Spawn `sh -c "pnpm dev"` in that directory, in a new session (`setsid`), with stdin from `/dev/null`.
+9. Spawn `sh -c "pnpm dev"` in that directory, in a new session (`setsid`), with stdin from `/dev/null` and every descriptor above stderr marked close-on-exec, so the project inherits only stdin, stdout and stderr.
 10. Record the group's identifier, port and leader start time in `state.json` as `ready: false`.
 11. Poll readiness until it succeeds, the process group exits, `startup_timeout_ms` is reached, or the user interrupts.
 12. On success, mark the entry `ready: true`; on failure, kill the group and remove the entry.
@@ -381,6 +382,33 @@ The flow is:
 6. Reconcile Caddy once at the end: with the route content unchanged the reconcile is a no-op, so `worth.localhost` briefly returns 502 while the new process boots instead of the route disappearing and coming back; if the start failed, the route is dropped instead.
 
 A failed start leaves the project stopped — a killed process cannot be resurrected — and the error says so explicitly. In the rare case where even the cleanup kill cannot confirm the process died, the error instead says it may still be running and names the pid, so a live process is never declared stopped.
+
+## Flow of `devhub start --all` and `devhub stop --all`
+
+`start` and `stop` also take several names (`devhub start blog worth`) or `--all`. A single name keeps exactly the flows above; anything else runs as a batch:
+
+```bash
+devhub start --all
+```
+
+1. The usual preamble: load state, prune, clean logs, reconcile Caddy.
+2. Pick the projects. `start --all` takes every project in `proj.json`. `stop --all` takes every live entry in `state.json` and never reads the config, so — like a single `stop` — it works while `proj.json` is broken, and it also stops projects that were removed from the config while running. Explicit names are deduplicated and sorted.
+3. Settle what needs no work, without touching any process: a `start` skips projects that are already running or starting, a `stop` skips projects that are not running, and a `start` of a name missing from the config fails on its own.
+4. `start` only: install the interrupt guard once around the whole batch (see below).
+5. Run every remaining project on its own thread, through the same `start_project` / `stop_project_if_running` path as a single command. Each prints one line as soon as it finishes, so lines appear in completion order.
+6. `start`: each project with a `port` updates the proxy routes right after it is ready, so its URL works without waiting for slower projects. `stop`: routes are reconciled once after all stops, since stopping is quick.
+7. Print a summary. Failures are detailed last, with their log tails, so they never interleave with projects still running; any failure makes the command exit non-zero.
+
+Projects are independent. A project that fails never stops, delays or rolls back another one, and nothing already started is undone because something else failed. Skipping is not an error: `start --all` with everything already running, or `stop --all` with nothing running, succeeds — unlike a single `start`/`stop`, which report "already running"/"not running" as errors.
+
+Four details make parallel work safe:
+
+- **State updates stay serialized.** Every thread works on its own copy of `AppState`, and `AppState::update` re-reads `state.json` under `flock`. Each thread opens the lock file separately, and `flock` locks belong to the open file description, so threads exclude each other just like separate devhub processes do.
+- **Route updates are serialized and read fresh.** If each thread applied the routes from its own snapshot, an update carrying fewer routes could land after one carrying more, dropping a ready project's URL. Route updates therefore take a mutex and reload the state inside it, so the last update always includes every project ready by then. A failing Caddy is warned about once, not once per project.
+- **Interrupt handling nests.** The guard that turns `SIGINT`/`SIGTERM`/`SIGHUP` into an "abort this start" flag is reference-counted: only the outermost guard clears the flag and swaps the handlers, and only the last one to go restores them. Otherwise the first project to finish would hand Ctrl-C back to its default action while the others still wait, and a start entering late would clear an interrupt the others had not seen yet. On Ctrl-C, every project still waiting for readiness is stopped and removed from state, projects that were already ready keep running, and devhub still prints the summary.
+- **Children inherit only stdio.** On macOS the standard library creates a pipe or socket and marks it close-on-exec in a second call. If another thread forks in between, the child inherits the descriptor — and a project or caddy's server holding the write end of someone's pipe would make the reader (a thread collecting `lsof` output, or another project's spawn waiting for its exec to report) wait forever for EOF. Before exec, projects and `caddy` therefore mark every descriptor above stderr close-on-exec.
+
+`restart` stays single-project.
 
 ## Flow of Caddy reconciliation
 

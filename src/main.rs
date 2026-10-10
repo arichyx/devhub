@@ -1,3 +1,4 @@
+mod batch;
 mod caddy;
 mod config;
 mod dirs;
@@ -5,10 +6,11 @@ mod logs;
 mod process;
 mod state;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use eyre::Result;
 
 #[derive(Parser)]
@@ -22,15 +24,31 @@ struct Cli {
 enum Commands {
     /// List all configured projects
     List,
-    /// Start a project
+    /// Start projects; several start in parallel
+    #[command(
+        group = targets(),
+        override_usage = "devhub start <NAME>...\n       devhub start --all"
+    )]
     Start {
-        /// Project name
-        name: String,
+        /// Projects to start
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Start every configured project that is not running
+        #[arg(short, long)]
+        all: bool,
     },
-    /// Stop a running project
+    /// Stop running projects; several stop in parallel
+    #[command(
+        group = targets(),
+        override_usage = "devhub stop <NAME>...\n       devhub stop --all"
+    )]
     Stop {
-        /// Project name
-        name: String,
+        /// Projects to stop
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Stop every running project, configured or not
+        #[arg(short, long)]
+        all: bool,
     },
     /// Restart a project (stop it first if running, then start it)
     Restart {
@@ -39,6 +57,13 @@ enum Commands {
     },
     /// Show status of all projects
     Status,
+}
+
+/// Project names or `--all`: exactly one of the two.
+fn targets() -> ArgGroup {
+    ArgGroup::new("targets")
+        .args(["names", "all"])
+        .required(true)
 }
 
 fn main() -> ExitCode {
@@ -76,11 +101,44 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::List => cmd_list(&config::Config::load()?),
-        Commands::Start { name } => cmd_start(&name, &config::Config::load()?, &mut state),
-        Commands::Stop { name } => cmd_stop(&name, &mut state),
+        Commands::Start { names, all } => {
+            let config = config::Config::load()?;
+            match names.as_slice() {
+                [name] => cmd_start(name, &config, &mut state),
+                _ if all => {
+                    batch::start(config.projects.keys().cloned().collect(), &config, &state)
+                }
+                _ => batch::start(dedup(names), &config, &state),
+            }
+        }
+        Commands::Stop { names, all } => match names.as_slice() {
+            [name] => cmd_stop(name, &mut state),
+            // From the state, not the config: like a single stop, this must
+            // work while proj.json is broken, and it also reaches projects
+            // that were removed from the config while running.
+            _ if all => {
+                let running = state
+                    .processes
+                    .iter()
+                    .filter(|(_, ps)| ps.is_alive())
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                batch::stop(running, &state)
+            }
+            _ => batch::stop(dedup(names), &state),
+        },
         Commands::Restart { name } => cmd_restart(&name, &config::Config::load()?, &mut state),
         Commands::Status => cmd_status(&config::Config::load()?, &state),
     }
+}
+
+/// Names in sorted order, each once, so a batch never runs a project twice.
+fn dedup(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn cmd_list(config: &config::Config) -> Result<()> {

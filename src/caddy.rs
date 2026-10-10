@@ -261,6 +261,9 @@ fn caddyfile_is_current(desired: &str, current: Option<&str>) -> bool {
 fn run_caddy(args: &[&str], log: Option<&Path>) -> eyre::Result<bool> {
     let mut command = Command::new("caddy");
     command.args(args).stdin(Stdio::null());
+    // `caddy start` leaves a server running that would hold any descriptor
+    // it inherits for as long as it lives.
+    crate::process::inherit_only_stdio(&mut command);
     match log {
         Some(path) => {
             // `caddy start` hands its stdout/stderr to the server it launches.
